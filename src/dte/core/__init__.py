@@ -1,0 +1,65 @@
+# Licensed under the Apache License, Version 2.0
+"""dte.core — Delta (incremental) weight transfer algorithms (backend-agnostic)."""
+
+from dte.core.codec import (
+    CODEC_VERSION,
+    DELTA_HEADER_NAME,
+    DELTA_IDX_SUFFIX,
+    DELTA_VAL_SUFFIX,
+    DecodedDelta,
+    DeltaHeader,
+    DeltaTracker,
+    EncodedDelta,
+    adamw_payload_changed_bitset_from_post_step,
+    apply_sparse_patch_,
+    bitwise_changed_mask,
+    decode_delta_payload,
+    int_view,
+    invert_adamw,
+    is_delta_payload,
+    pack_bool_mask_to_uint8,
+    packed_bool_mask_to_indices,
+    payload_changed_bitset_from_pre_post,
+    payload_changed_mask_from_pre_post,
+    reconstruct_against_base,
+    unpack_bool_mask_from_uint8,
+)
+from dte.core.detector import DeltaWeightDetector
+from dte.core.patch import (
+    DeltaResult,
+    SparseWeightPatch,
+    dict_to_patches,
+    patches_to_dict,
+)
+from dte.core.remap import remap_delta_indices, remap_patches_for_operation
+
+__all__ = [
+    "CODEC_VERSION",
+    "DELTA_HEADER_NAME",
+    "DELTA_IDX_SUFFIX",
+    "DELTA_VAL_SUFFIX",
+    "DecodedDelta",
+    "DeltaHeader",
+    "DeltaResult",
+    "DeltaTracker",
+    "DeltaWeightDetector",
+    "EncodedDelta",
+    "SparseWeightPatch",
+    "adamw_payload_changed_bitset_from_post_step",
+    "apply_sparse_patch_",
+    "bitwise_changed_mask",
+    "decode_delta_payload",
+    "dict_to_patches",
+    "int_view",
+    "invert_adamw",
+    "is_delta_payload",
+    "pack_bool_mask_to_uint8",
+    "packed_bool_mask_to_indices",
+    "payload_changed_bitset_from_pre_post",
+    "payload_changed_mask_from_pre_post",
+    "patches_to_dict",
+    "reconstruct_against_base",
+    "remap_delta_indices",
+    "remap_patches_for_operation",
+    "unpack_bool_mask_from_uint8",
+]

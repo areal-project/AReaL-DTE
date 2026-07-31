@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delta-transfer-engine"
+version = "0.0.1"
+description = "Delta Transfer Engine (dte): incremental weight sync for RL training across distributed shard layouts."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+authors = [{ name = "AReaL Team" }]
+maintainers = [
+    { name = "Ding Zhiqiang", email = "26423893+dingzhiqiang@users.noreply.github.com" },
+]
+keywords = ["rl", "weight-sync", "delta", "sparse", "llm", "training", "inference"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Core is dependency-light on purpose: the incremental algorithm stands alone.
+dependencies = [
+    "torch>=2.9.1,<2.11; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch<2.9.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
+[project.urls]
+Homepage = "https://github.com/areal-project/AReaL-DTE"
+Repository = "https://github.com/areal-project/AReaL-DTE"
+Issues = "https://github.com/areal-project/AReaL-DTE/issues"
+
+[project.optional-dependencies]
+# Transport backends are pluggable adapters, installed on demand.
+# `awex` reuses the AReaL-maintained AWEX fork's reshard plan + NCCL transport.
+awex = ["awex @ git+https://github.com/dingzhiqiang/asystem-awex.git@main"]
+# `mooncake-transfer-engine` is the Mooncake Transfer Engine PyPI distribution.
+mooncake = ["mooncake-transfer-engine"]  # disaggregated RDMA put/get
+dev = [
+    "build>=1.2",
+    "mdformat==0.7.17",
+    "mdformat-gfm",
+    "mdformat-tables",
+    "pre-commit>=4.0",
+    "pytest>=7.0",
+    "pytest-xdist",
+    "ruff==0.14.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP"]
+ignore = ["E501"]
