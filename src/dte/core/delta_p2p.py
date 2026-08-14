@@ -35,10 +35,7 @@ import torch
 
 from dte.core.codec import DecodedDelta, apply_sparse_patch_
 from dte.core.patch import SparseWeightPatch
-from dte.core.remap import (
-    remap_delta_indices_for_ops,
-    remap_mask_for_op,
-)
+from dte.core.remap import remap_delta_indices_for_ops
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +69,23 @@ class OpDeltaPayload:
         return int(self.indices.numel())
 
 
+def _empty_payload_with_dtype(op, dtype: torch.dtype) -> OpDeltaPayload:
+    return OpDeltaPayload(
+        op=op,
+        indices=torch.empty(0, dtype=torch.int32),
+        values=torch.empty(0, dtype=dtype),
+    )
+
+
+def _empty_payload_for_send(
+    op,
+    send_params: dict[str, torch.Tensor],
+) -> OpDeltaPayload:
+    name = op.send_shard_meta.name
+    dtype = send_params[name].dtype if name in send_params else torch.bfloat16
+    return _empty_payload_with_dtype(op, dtype)
+
+
 def build_send_patches(
     ops: list,
     masks: dict[str, torch.Tensor],
@@ -81,47 +95,84 @@ def build_send_patches(
 
     Args:
         ops: CommunicationOperations for one peer (send direction).
-        masks: ``{hf_name: bool change mask}`` over the train-shard param;
-            computed once per param, shared across that param's ops.
+        masks: ``{hf_name: change mask or flat change indices}`` over the
+            train-shard param. Bool masks are converted to indices once per
+            parameter; int32/int64 inputs are already flat indices. The result
+            is shared across all operations for that parameter.
         send_params: ``{hf_name: train-shard tensor}`` (value source).
 
     Returns:
         List parallel to ``ops``; every op gets a payload, empty if no overlap.
     """
-    payloads: list[OpDeltaPayload] = []
-    for op in ops:
+    payloads: list[OpDeltaPayload | None] = [None] * len(ops)
+    groups: dict[tuple[str, tuple[int, ...]], list[tuple[int, object]]] = {}
+
+    for i, op in enumerate(ops):
         name = op.send_shard_meta.name
         mask = masks.get(name)
         src = send_params.get(name)
-        patch: SparseWeightPatch | None = None
-        if mask is not None and src is not None:
-            patch = remap_mask_for_op(name, mask, src, tuple(src.shape), op)
-        if patch is None:
+        if mask is None or src is None:
             # zero-nnz slot: keep the op so both peers stay symmetric.
-            dtype = send_params[name].dtype if name in send_params else torch.bfloat16
-            payloads.append(
-                OpDeltaPayload(
-                    op=op,
-                    indices=torch.empty(0, dtype=torch.int32),
-                    values=torch.empty(0, dtype=dtype),
-                )
-            )
+            payloads[i] = _empty_payload_for_send(op, send_params)
+            continue
+        groups.setdefault((name, tuple(src.shape)), []).append((i, op))
+
+    for (name, train_shape), entries in groups.items():
+        mask = masks[name]
+        src = send_params[name]
+        if mask.dtype == torch.bool:
+            indices = mask.reshape(-1).nonzero(as_tuple=True)[0]
+            assume_sorted = True
+        elif mask.dtype in {torch.int32, torch.int64}:
+            indices = mask.reshape(-1)
+            assume_sorted = False
         else:
-            payloads.append(
-                OpDeltaPayload(op=op, indices=patch.indices, values=patch.values)
+            raise TypeError(
+                f"change indices for {name!r} must be bool, int32, or int64; "
+                f"got {mask.dtype}"
             )
-    return payloads
+
+        if indices.numel() == 0:
+            for i, op in entries:
+                payloads[i] = _empty_payload_for_send(op, send_params)
+            continue
+
+        gather_indices = (
+            indices if indices.dtype == torch.long else indices.to(torch.long)
+        )
+        values = src.reshape(-1).index_select(0, gather_indices)
+        patch = SparseWeightPatch(
+            name=name,
+            indices=indices.to(torch.int32),
+            values=values,
+        )
+        remapped = remap_delta_indices_for_ops(
+            patch,
+            train_shape=train_shape,
+            operations=[op for _, op in entries],
+            assume_sorted=assume_sorted,
+        )
+        for (i, op), op_patch in zip(entries, remapped, strict=True):
+            if op_patch is None:
+                payloads[i] = _empty_payload_for_send(op, send_params)
+            else:
+                payloads[i] = OpDeltaPayload(
+                    op=op,
+                    indices=op_patch.indices,
+                    values=op_patch.values,
+                )
+
+    missing = [i for i, payload in enumerate(payloads) if payload is None]
+    if missing:
+        raise RuntimeError(f"delta payload build missed op slots: {missing[:5]}")
+    return [payload for payload in payloads if payload is not None]
 
 
 def _empty_payload(op) -> OpDeltaPayload:
     dtype = getattr(op.recv_shard_meta, "dtype", None) or getattr(
         op.send_shard_meta, "dtype", torch.bfloat16
     )
-    return OpDeltaPayload(
-        op=op,
-        indices=torch.empty(0, dtype=torch.int32),
-        values=torch.empty(0, dtype=dtype),
-    )
+    return _empty_payload_with_dtype(op, dtype)
 
 
 def _slice_flat_indices(

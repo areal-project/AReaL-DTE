@@ -764,6 +764,7 @@ class TestDeltaP2PProtocol:
         op1 = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
         payloads = build_send_patches([op0, op1], {"w": mask}, {"w": train})
         assert len(payloads) == 2  # both ops kept
+        assert [payload.op for payload in payloads] == [op0, op1]
         assert payloads[0].nnz == 1
         assert payloads[1].nnz == 0  # zero-nnz slot preserved
         nnz = nnz_vector(payloads)
@@ -812,6 +813,73 @@ class TestDeltaP2PProtocol:
         assert by_op[_mod_p2p.op_key(op1)].nnz == 1
         # distinct keys (different recv_rank + train_slices)
         assert _mod_p2p.op_key(op0) != _mod_p2p.op_key(op1)
+
+    def test_build_send_patches_groups_same_param_ops(self, monkeypatch):
+        train = torch.zeros(8, 4, dtype=torch.bfloat16)
+        train[1, 0] = 1.0
+        train[5, 0] = 2.0
+        mask = train != 0
+        op0 = _make_op(
+            (slice(0, 4), slice(None)),
+            (slice(0, 4), slice(None)),
+            (4, 4),
+        )
+        op1 = _make_op(
+            (slice(4, 8), slice(None)),
+            (slice(0, 4), slice(None)),
+            (4, 4),
+        )
+        original = _mod_p2p.remap_delta_indices_for_ops
+        group_sizes = []
+
+        def counting_remap(patch, train_shape, operations, **kwargs):
+            group_sizes.append(len(operations))
+            return original(patch, train_shape, operations, **kwargs)
+
+        monkeypatch.setattr(
+            _mod_p2p,
+            "remap_delta_indices_for_ops",
+            counting_remap,
+        )
+
+        payloads = build_send_patches([op0, op1], {"w": mask}, {"w": train})
+
+        assert group_sizes == [2]
+        assert [payload.op for payload in payloads] == [op0, op1]
+        assert [payload.nnz for payload in payloads] == [1, 1]
+        assert torch.equal(payloads[0].indices, torch.tensor([4], dtype=torch.int32))
+        assert torch.equal(payloads[1].indices, torch.tensor([4], dtype=torch.int32))
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    def test_build_send_payloads_accepts_external_flat_indices(self, index_dtype):
+        train = torch.tensor(
+            [10.0, 20.0, 30.0, 40.0],
+            dtype=torch.bfloat16,
+        )
+        indices = torch.tensor([1, 3], dtype=index_dtype)
+        op = _make_op((slice(None),), (slice(None),), (4,))
+        op.recv_rank = 0
+
+        payloads = _mod_p2p.build_send_payloads_by_op(
+            [op],
+            {"w": indices},
+            {"w": train},
+        )
+        payload = payloads[_mod_p2p.op_key(op)]
+
+        assert torch.equal(payload.indices, torch.tensor([1, 3], dtype=torch.int32))
+        assert torch.equal(payload.values.float(), torch.tensor([20.0, 40.0]))
+
+    def test_build_send_patches_rejects_non_mask_non_index_dtype(self):
+        train = torch.arange(4, dtype=torch.bfloat16)
+        op = _make_op((slice(None),), (slice(None),), (4,))
+
+        with pytest.raises(TypeError, match="bool, int32, or int64"):
+            build_send_patches(
+                [op],
+                {"w": torch.tensor([1.0, 3.0])},
+                {"w": train},
+            )
 
 
 @pytest.mark.skip(
