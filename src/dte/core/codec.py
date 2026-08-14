@@ -615,6 +615,37 @@ class DeltaTracker:
             time.time() - start,
         )
 
+    def mark_delta_committed(self, version: int) -> None:
+        """Advance the version chain after an externally encoded delta succeeds.
+
+        Integrations which build and transfer sparse payloads without calling
+        :meth:`encode` must call this only after the payload is durably applied
+        by the receiver. Failed transfers must not advance the chain or the
+        anchor counter.
+        """
+        if not self.seeded:
+            raise RuntimeError("DeltaTracker not seeded; run a full sync first.")
+        reason = self.full_sync_reason(version)
+        if reason is not None:
+            raise RuntimeError(
+                f"Delta version {version} requires a full sync ({reason})."
+            )
+        assert self._base_version is not None
+        expected_version = self._base_version + 1
+        if version != expected_version:
+            raise ValueError(
+                "Committed delta version must be contiguous with the base: "
+                f"base={self._base_version}, expected={expected_version}, "
+                f"version={version}."
+            )
+        self._base_version = version
+        self._deltas_since_anchor += 1
+        logger.info(
+            "DeltaTracker: externally committed delta version %d (%d since anchor)",
+            version,
+            self._deltas_since_anchor,
+        )
+
     @torch.no_grad()
     def encode(
         self,

@@ -1131,6 +1131,51 @@ class TestDeltaTrackerRoundTrip:
         reason = tracker.full_sync_reason(3)
         assert reason is not None and "anchor_interval" in reason
 
+    def test_external_delta_commits_advance_anchor_interval(self):
+        base = {"w": torch.zeros(10, dtype=torch.bfloat16)}
+        tracker = DeltaTracker(anchor_interval=2)
+        tracker.seed(_named(base), 1)
+
+        tracker.mark_delta_committed(2)
+        assert tracker.base_version == 2
+        assert tracker.full_sync_reason(3) is None
+
+        tracker.mark_delta_committed(3)
+        assert tracker.base_version == 3
+        assert tracker.full_sync_reason(4) == "anchor_interval:2"
+
+        with pytest.raises(RuntimeError, match="requires a full sync"):
+            tracker.mark_delta_committed(4)
+        assert tracker.base_version == 3
+
+    def test_external_delta_commit_rejects_unseeded_tracker(self):
+        tracker = DeltaTracker(anchor_interval=20)
+
+        with pytest.raises(RuntimeError, match="not seeded"):
+            tracker.mark_delta_committed(1)
+        assert tracker.base_version is None
+
+    def test_external_delta_commit_rejects_version_gap_without_state_change(self):
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named({"w": torch.zeros(4, dtype=torch.bfloat16)}), 1)
+
+        with pytest.raises(ValueError, match="expected=2, version=3"):
+            tracker.mark_delta_committed(3)
+
+        assert tracker.base_version == 1
+        assert tracker.full_sync_reason(2) is None
+
+    def test_external_delta_commit_honors_requested_full_sync(self):
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named({"w": torch.zeros(4, dtype=torch.bfloat16)}), 1)
+        tracker.request_full_sync("reader_mismatch")
+
+        with pytest.raises(RuntimeError, match="requested:reader_mismatch"):
+            tracker.mark_delta_committed(2)
+
+        assert tracker.base_version == 1
+        assert tracker.full_sync_reason(2) == "requested:reader_mismatch"
+
     def test_request_full_sync(self):
         base = {"w": torch.zeros(10, dtype=torch.bfloat16)}
         tracker = DeltaTracker()
