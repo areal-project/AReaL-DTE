@@ -1150,7 +1150,7 @@ class TestDeltaTrackerRoundTrip:
     def test_external_delta_commits_advance_anchor_interval(self):
         base = {"w": torch.zeros(10, dtype=torch.bfloat16)}
         tracker = DeltaTracker(anchor_interval=2)
-        tracker.seed(_named(base), 1)
+        tracker.seed(_named(base), 1, store_snapshot=False)
 
         tracker.mark_delta_committed(2)
         assert tracker.base_version == 2
@@ -1171,9 +1171,63 @@ class TestDeltaTrackerRoundTrip:
             tracker.mark_delta_committed(1)
         assert tracker.base_version is None
 
-    def test_external_delta_commit_rejects_version_gap_without_state_change(self):
+    def test_external_delta_commit_patches_snapshot_before_advancing(self):
+        base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named(base), 1)
+
+        current = {"w": base["w"].clone()}
+        current["w"][0] = 1.0
+        tracker.mark_delta_committed(
+            2,
+            named_parameters=_named(current),
+            masks={"w": torch.tensor([0], dtype=torch.int64)},
+        )
+        assert tracker.base_version == 2
+
+        # Reverting to the v1 seed value must still be encoded. This is the
+        # regression case from the external-commit snapshot review: a stale v1
+        # snapshot would incorrectly classify the v3 value as unchanged.
+        reverted = {"w": base["w"].clone()}
+        encoded = tracker.encode(_named(reverted), 3)
+        assert encoded.changed_elements == 1
+        assert tracker.base_version == 3
+
+    def test_external_delta_commit_requires_snapshot_patch_inputs(self):
         tracker = DeltaTracker(anchor_interval=20)
         tracker.seed(_named({"w": torch.zeros(4, dtype=torch.bfloat16)}), 1)
+
+        with pytest.raises(RuntimeError, match="snapshot patch inputs"):
+            tracker.mark_delta_committed(2)
+
+        assert tracker.base_version == 1
+        assert tracker.full_sync_reason(2) is None
+
+    def test_external_delta_commit_invalid_snapshot_patch_is_atomic(self):
+        base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named(base), 1)
+
+        current = {"w": base["w"].clone()}
+        current["w"][0] = 1.0
+        with pytest.raises(ValueError, match="out of range"):
+            tracker.mark_delta_committed(
+                2,
+                named_parameters=_named(current),
+                masks={"w": torch.tensor([4], dtype=torch.int64)},
+            )
+
+        assert tracker.base_version == 1
+        encoded = tracker.encode(_named(current), 2)
+        assert encoded.changed_elements == 1
+
+    def test_external_delta_commit_rejects_version_gap_without_state_change(self):
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(
+            _named({"w": torch.zeros(4, dtype=torch.bfloat16)}),
+            1,
+            store_snapshot=False,
+        )
 
         with pytest.raises(ValueError, match="expected=2, version=3"):
             tracker.mark_delta_committed(3)
@@ -1183,7 +1237,11 @@ class TestDeltaTrackerRoundTrip:
 
     def test_external_delta_commit_honors_requested_full_sync(self):
         tracker = DeltaTracker(anchor_interval=20)
-        tracker.seed(_named({"w": torch.zeros(4, dtype=torch.bfloat16)}), 1)
+        tracker.seed(
+            _named({"w": torch.zeros(4, dtype=torch.bfloat16)}),
+            1,
+            store_snapshot=False,
+        )
         tracker.request_full_sync("reader_mismatch")
 
         with pytest.raises(RuntimeError, match="requested:reader_mismatch"):
