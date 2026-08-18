@@ -141,9 +141,13 @@ def build_send_patches(
             indices if indices.dtype == torch.long else indices.to(torch.long)
         )
         values = src.reshape(-1).index_select(0, gather_indices)
+        # This patch is an internal train-space remap input, not a wire-format
+        # payload. Keep indices in int64 until remapping finishes: a valid
+        # train index may exceed int32 even when the resulting inference-shard
+        # index is small enough for the int32 transport protocol.
         patch = SparseWeightPatch(
             name=name,
-            indices=indices.to(torch.int32),
+            indices=indices.to(torch.int64),
             values=values,
         )
         remapped = remap_delta_indices_for_ops(

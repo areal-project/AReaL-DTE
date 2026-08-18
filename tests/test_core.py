@@ -870,6 +870,22 @@ class TestDeltaP2PProtocol:
         assert torch.equal(payload.indices, torch.tensor([1, 3], dtype=torch.int32))
         assert torch.equal(payload.values.float(), torch.tensor([20.0, 40.0]))
 
+    def test_build_send_patches_preserves_large_int64_train_indices(self):
+        train_numel = 2**31 + 8
+        train = torch.empty(train_numel, dtype=torch.bfloat16, device="meta")
+        indices = torch.tensor([2**31 + 3], dtype=torch.int64)
+        op = _make_op(
+            (slice(2**31, train_numel),),
+            (slice(0, 8),),
+            (8,),
+        )
+
+        payload = build_send_patches([op], {"w": indices}, {"w": train})[0]
+
+        assert torch.equal(payload.indices, torch.tensor([3], dtype=torch.int32))
+        assert payload.values.shape == (1,)
+        assert payload.values.device.type == "meta"
+
     def test_build_send_patches_rejects_non_mask_non_index_dtype(self):
         train = torch.arange(4, dtype=torch.bfloat16)
         op = _make_op((slice(None),), (slice(None),), (4,))
