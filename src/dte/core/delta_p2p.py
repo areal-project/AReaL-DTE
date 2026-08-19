@@ -137,17 +137,18 @@ def build_send_patches(
                 payloads[i] = _empty_payload_for_send(op, send_params)
             continue
 
-        gather_indices = (
-            indices if indices.dtype == torch.long else indices.to(torch.long)
-        )
-        values = src.reshape(-1).index_select(0, gather_indices)
+        # External compact indices may live on CPU while the parameter lives on
+        # CUDA/MPS. Normalize once before both gathering and remapping so every
+        # indexing tensor stays colocated with the values it selects.
+        indices = indices.to(device=src.device, dtype=torch.int64)
+        values = src.reshape(-1).index_select(0, indices)
         # This patch is an internal train-space remap input, not a wire-format
         # payload. Keep indices in int64 until remapping finishes: a valid
         # train index may exceed int32 even when the resulting inference-shard
         # index is small enough for the int32 transport protocol.
         patch = SparseWeightPatch(
             name=name,
-            indices=indices.to(torch.int64),
+            indices=indices,
             values=values,
         )
         remapped = remap_delta_indices_for_ops(

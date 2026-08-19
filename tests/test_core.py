@@ -872,7 +872,13 @@ class TestDeltaP2PProtocol:
 
     def test_build_send_patches_preserves_large_int64_train_indices(self):
         train_numel = 2**31 + 8
-        train = torch.empty(train_numel, dtype=torch.bfloat16, device="meta")
+        # A zero-stride view represents the large logical train shard while
+        # retaining only one element of physical storage. Unlike a meta tensor,
+        # it still exercises real indexing and remapping semantics.
+        train = torch.tensor([7.0], dtype=torch.bfloat16).as_strided(
+            (train_numel,),
+            (0,),
+        )
         indices = torch.tensor([2**31 + 3], dtype=torch.int64)
         op = _make_op(
             (slice(2**31, train_numel),),
@@ -883,8 +889,51 @@ class TestDeltaP2PProtocol:
         payload = build_send_patches([op], {"w": indices}, {"w": train})[0]
 
         assert torch.equal(payload.indices, torch.tensor([3], dtype=torch.int32))
-        assert payload.values.shape == (1,)
-        assert payload.values.device.type == "meta"
+        assert torch.equal(payload.values, torch.tensor([7.0], dtype=torch.bfloat16))
+
+    @pytest.mark.parametrize(
+        "device_type",
+        [
+            pytest.param(
+                "cuda",
+                marks=pytest.mark.skipif(
+                    not torch.cuda.is_available(),
+                    reason="CUDA is not available",
+                ),
+            ),
+            pytest.param(
+                "mps",
+                marks=pytest.mark.skipif(
+                    not torch.backends.mps.is_available(),
+                    reason="MPS is not available",
+                ),
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    def test_build_send_patches_moves_cpu_indices_to_source_device(
+        self,
+        device_type,
+        index_dtype,
+    ):
+        train = torch.tensor(
+            [10.0, 20.0, 30.0, 40.0],
+            dtype=torch.float32,
+            device=device_type,
+        )
+        indices = torch.tensor([1, 3], dtype=index_dtype, device="cpu")
+        op = _make_op((slice(None),), (slice(None),), (4,))
+
+        payload = build_send_patches([op], {"w": indices}, {"w": train})[0]
+
+        assert indices.device.type == "cpu"
+        assert payload.indices.device == train.device
+        assert payload.values.device == train.device
+        assert torch.equal(
+            payload.indices.cpu(),
+            torch.tensor([1, 3], dtype=torch.int32),
+        )
+        assert torch.equal(payload.values.cpu(), torch.tensor([20.0, 40.0]))
 
     def test_build_send_patches_rejects_non_mask_non_index_dtype(self):
         train = torch.arange(4, dtype=torch.bfloat16)
