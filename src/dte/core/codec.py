@@ -573,7 +573,9 @@ class DeltaTracker:
                 (inversion detector) keep no baseline tensors — change masks come
                 from AdamW inversion, so we only record the seen names so
                 ``encode(masks=...)`` can distinguish known from unknown params.
-                The detector mode is fixed until the next ``seed`` call.
+                A snapshot-free tracker must be reseeded before switching to
+                snapshot diff; snapshot-backed trackers may consume complete
+                external masks while keeping their baseline current.
         """
         start = time.time()
         self._snapshot.clear()
@@ -621,24 +623,24 @@ class DeltaTracker:
     def mark_delta_committed(
         self,
         version: int,
+        *,
+        named_parameters: Iterable[tuple[str, torch.Tensor]] | None = None,
+        masks: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Advance the version chain after an externally encoded delta succeeds.
 
         Integrations which build and transfer sparse payloads without calling
-        :meth:`encode` must call this only after the payload is durably applied by
-        the receiver. This API belongs exclusively to external/inversion mode
-        (``seed(..., store_snapshot=False)``). Snapshot-backed trackers advance
-        through ``encode(masks=None)`` so their baseline and version stay atomic.
-        Failed transfers must not call this method.
+        :meth:`encode` must call this only after the payload is durably applied
+        by the receiver. For a snapshot-backed tracker, ``named_parameters`` and
+        the externally applied ``masks`` are required so this method can patch
+        the CPU baseline before advancing the version. ``masks`` may omit
+        unchanged parameters. In inversion mode
+        (``seed(..., store_snapshot=False)``), both remain optional because no
+        CPU snapshot exists. Failed transfers or invalid snapshot patches must
+        not advance the chain or the anchor counter.
         """
         if not self.seeded:
             raise RuntimeError("DeltaTracker not seeded; run a full sync first.")
-        if self._snapshot_backed:
-            raise RuntimeError(
-                "mark_delta_committed() is only valid for a tracker seeded with "
-                "store_snapshot=False; snapshot-backed trackers must advance "
-                "through encode(masks=None)."
-            )
         reason = self.full_sync_reason(version)
         if reason is not None:
             raise RuntimeError(
@@ -653,6 +655,23 @@ class DeltaTracker:
                 f"version={version}."
             )
 
+        if self._snapshot_backed:
+            if named_parameters is None or masks is None:
+                raise RuntimeError(
+                    "Snapshot-backed external commits require snapshot patch "
+                    "inputs: named_parameters and masks."
+                )
+            updates = self._prepare_external_snapshot_updates(
+                named_parameters,
+                masks,
+            )
+            self._apply_external_snapshot_updates(updates)
+        elif named_parameters is not None or masks is not None:
+            raise ValueError(
+                "Snapshot patch inputs are only valid for a snapshot-backed "
+                "DeltaTracker."
+            )
+
         self._base_version = version
         self._deltas_since_anchor += 1
         logger.info(
@@ -660,6 +679,121 @@ class DeltaTracker:
             version,
             self._deltas_since_anchor,
         )
+
+    @torch.no_grad()
+    def _prepare_external_snapshot_updates(
+        self,
+        named_parameters: Iterable[tuple[str, torch.Tensor]],
+        masks: dict[str, torch.Tensor],
+        *,
+        require_complete_masks: bool = False,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Validate and stage sparse CPU snapshot patches without mutating state."""
+        params: dict[str, torch.Tensor] = {}
+        for name, param in named_parameters:
+            _check_reserved_names((name,))
+            if name in params:
+                raise ValueError(f"Duplicate external snapshot parameter: {name}")
+            params[name] = param
+
+        expected_names = set(self._snapshot)
+        param_names = set(params)
+        mask_names = set(masks)
+        if param_names != expected_names:
+            missing = sorted(expected_names - param_names)
+            extra = sorted(param_names - expected_names)
+            raise ValueError(
+                "External snapshot parameters do not match the stored snapshot: "
+                f"missing={missing}, extra={extra}."
+            )
+
+        extra_masks = sorted(mask_names - expected_names)
+        missing_masks = sorted(expected_names - mask_names)
+        if extra_masks or (require_complete_masks and missing_masks):
+            raise ValueError(
+                "External snapshot masks do not match the stored snapshot: "
+                f"missing={missing_masks if require_complete_masks else []}, "
+                f"extra={extra_masks}."
+            )
+
+        updates: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        for name, current in params.items():
+            baseline = self._snapshot[name]
+            cur = current.detach().contiguous()
+            if baseline.dtype != cur.dtype or baseline.shape != cur.shape:
+                raise ValueError(
+                    f"External snapshot parameter mismatch for {name}: "
+                    f"snapshot=({baseline.shape}, {baseline.dtype}), "
+                    f"current=({cur.shape}, {cur.dtype})."
+                )
+
+            if name not in masks:
+                continue
+            mask = masks[name]
+
+            numel = cur.numel()
+            if mask.dtype == torch.bool:
+                if mask.numel() != numel:
+                    raise ValueError(
+                        f"External snapshot bool mask size mismatch for {name}: "
+                        f"mask={mask.numel()}, parameter={numel}."
+                    )
+                indices = (
+                    mask.to(cur.device, non_blocking=False)
+                    .reshape(-1)
+                    .nonzero(as_tuple=False)
+                    .squeeze(1)
+                )
+            elif mask.dtype in {torch.int32, torch.int64}:
+                indices = mask.to(
+                    cur.device,
+                    dtype=torch.long,
+                    non_blocking=False,
+                ).reshape(-1)
+                if indices.numel() and bool(
+                    ((indices < 0) | (indices >= numel)).any().item()
+                ):
+                    raise ValueError(
+                        f"External snapshot indices out of range for {name}."
+                    )
+            else:
+                raise TypeError(
+                    f"External snapshot mask for {name} must be bool, int32, "
+                    f"or int64, got {mask.dtype}."
+                )
+
+            cpu_indices = indices.to("cpu", dtype=torch.long, non_blocking=False)
+            flat_baseline = baseline.reshape(-1)
+            old_values = flat_baseline.index_select(0, cpu_indices).clone()
+            new_values = (
+                cur.reshape(-1)
+                .index_select(0, indices)
+                .to("cpu", non_blocking=False)
+                .clone()
+            )
+            updates.append((baseline, cpu_indices, new_values, old_values))
+        return updates
+
+    @staticmethod
+    @torch.no_grad()
+    def _apply_external_snapshot_updates(
+        updates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Apply prepared patches and roll back all prior writes on failure."""
+        applied: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        try:
+            for update in updates:
+                baseline, indices, new_values, _ = update
+                baseline.reshape(-1).index_copy_(0, indices, new_values)
+                applied.append(update)
+        except Exception:
+            for baseline, indices, _, old_values in reversed(applied):
+                baseline.reshape(-1).index_copy_(0, indices, old_values)
+            raise
 
     @torch.no_grad()
     def encode(
@@ -677,30 +811,35 @@ class DeltaTracker:
             version: The payload (target) version; becomes the new base.
             masks: optional ``{hf_name: bool change mask}`` from an external
                 detector (AdamW inversion). When provided, the change mask comes
-                from ``masks`` instead of an internal snapshot diff, and the CPU
-                snapshot is NOT refreshed (inversion mode keeps no baseline). A
-                name missing from ``masks`` falls back to dense. When ``masks``
-                is None the snapshot detector is used. The selected path must
-                match the ``store_snapshot`` mode of the latest ``seed`` call.
+                from ``masks`` instead of an internal snapshot diff. In inversion
+                mode the tracker keeps no baseline. A snapshot-backed tracker
+                requires one mask entry for every snapshot parameter and patches
+                its baseline before committing the version. A name missing from
+                ``masks`` falls back to dense only in inversion mode. When
+                ``masks`` is None the snapshot detector is used; a snapshot-free
+                tracker must be reseeded with ``store_snapshot=True`` before
+                selecting that path.
 
-        The snapshot is refreshed in place (snapshot mode only), so after this
-        call the tracker's base is ``version``.
+        When the tracker has a snapshot, its baseline is refreshed in place, so
+        after this call the tracker's base is ``version``.
         """
         if not self.seeded:
             raise RuntimeError("DeltaTracker not seeded; run a full sync first.")
 
         external = masks is not None
-        if self._snapshot_backed and external:
-            raise RuntimeError(
-                "External masks require a tracker seeded with "
-                "store_snapshot=False; snapshot-backed trackers must use "
-                "encode(masks=None)."
-            )
         if not self._snapshot_backed and not external:
             raise RuntimeError(
                 "Snapshot diff requires a tracker seeded with "
                 "store_snapshot=True; external/inversion trackers must provide "
                 "masks or be reseeded."
+            )
+        snapshot_updates = None
+        if self._snapshot_backed and external:
+            named_parameters = list(named_parameters)
+            snapshot_updates = self._prepare_external_snapshot_updates(
+                named_parameters,
+                masks,
+                require_complete_masks=True,
             )
         start = time.time()
         result = EncodedDelta()
@@ -727,7 +866,11 @@ class DeltaTracker:
             # Resolve the change mask source: external detector vs snapshot.
             ext_indices: torch.Tensor | None = None
             if external:
-                known = name in self._snapshot_names
+                known = (
+                    name in self._snapshot
+                    if self._snapshot_backed
+                    else name in self._snapshot_names
+                )
                 ext_mask = masks.get(name)
                 bad = ext_mask is None
                 if ext_mask is not None and not bad:
@@ -828,6 +971,8 @@ class DeltaTracker:
         result.names.insert(0, DELTA_HEADER_NAME)
         result.tensors.insert(0, result.header.to_tensor(device=header_device))
 
+        if snapshot_updates is not None:
+            self._apply_external_snapshot_updates(snapshot_updates)
         self._base_version = version
         self._deltas_since_anchor += 1
         logger.info(

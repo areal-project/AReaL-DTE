@@ -1220,34 +1220,147 @@ class TestDeltaTrackerRoundTrip:
             tracker.mark_delta_committed(1)
         assert tracker.base_version is None
 
-    def test_snapshot_tracker_rejects_external_commit_without_state_change(self):
+    def test_external_delta_commit_patches_snapshot_before_advancing(self):
         base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
         tracker = DeltaTracker(anchor_interval=20)
         tracker.seed(_named(base), 1)
 
         current = {"w": base["w"].clone()}
         current["w"][0] = 1.0
-        with pytest.raises(RuntimeError, match="only valid.*store_snapshot=False"):
+        tracker.mark_delta_committed(
+            2,
+            named_parameters=_named(current),
+            masks={"w": torch.tensor([0], dtype=torch.int64)},
+        )
+        assert tracker.base_version == 2
+
+        # Reverting to the v1 seed value must still be encoded. A stale v1
+        # snapshot would incorrectly classify the v3 value as unchanged.
+        reverted = {"w": base["w"].clone()}
+        encoded = tracker.encode(_named(reverted), 3)
+        assert encoded.changed_elements == 1
+        assert tracker.base_version == 3
+
+    def test_external_delta_commit_accepts_sparse_mask_dictionary(self):
+        base = {
+            "changed": torch.zeros(4, dtype=torch.bfloat16),
+            "unchanged": torch.zeros(4, dtype=torch.bfloat16),
+        }
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named(base), 1)
+
+        current = {name: value.clone() for name, value in base.items()}
+        current["changed"][1] = 2.0
+        tracker.mark_delta_committed(
+            2,
+            named_parameters=_named(current),
+            masks={"changed": torch.tensor([1], dtype=torch.int64)},
+        )
+
+        assert tracker.base_version == 2
+        encoded = tracker.encode(_named(current), 3)
+        assert encoded.changed_elements == 0
+
+    def test_external_zero_delta_commit_accepts_empty_masks(self):
+        base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named(base), 1)
+
+        tracker.mark_delta_committed(
+            2,
+            named_parameters=_named(base),
+            masks={},
+        )
+
+        assert tracker.base_version == 2
+        encoded = tracker.encode(_named(base), 3)
+        assert encoded.changed_elements == 0
+
+    def test_external_delta_commit_requires_snapshot_patch_inputs(self):
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named({"w": torch.zeros(4, dtype=torch.bfloat16)}), 1)
+
+        with pytest.raises(RuntimeError, match="snapshot patch inputs"):
             tracker.mark_delta_committed(2)
 
         assert tracker.base_version == 1
         assert tracker.full_sync_reason(2) is None
+
+    def test_external_delta_commit_rejects_extra_mask_without_state_change(self):
+        base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named(base), 1)
+        current = {"w": base["w"].clone()}
+        current["w"][0] = 1.0
+
+        with pytest.raises(ValueError, match=r"extra=\['ghost'\]"):
+            tracker.mark_delta_committed(
+                2,
+                named_parameters=_named(current),
+                masks={
+                    "w": torch.tensor([0], dtype=torch.int64),
+                    "ghost": torch.tensor([0], dtype=torch.int64),
+                },
+            )
+
+        assert tracker.base_version == 1
         encoded = tracker.encode(_named(current), 2)
         assert encoded.changed_elements == 1
         assert tracker.base_version == 2
 
-    def test_snapshot_tracker_rejects_external_encode_without_state_change(self):
+    def test_external_delta_commit_invalid_snapshot_patch_is_atomic(self):
+        base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
+        tracker = DeltaTracker(anchor_interval=20)
+        tracker.seed(_named(base), 1)
+
+        current = {"w": base["w"].clone()}
+        current["w"][0] = 1.0
+        with pytest.raises(ValueError, match="out of range"):
+            tracker.mark_delta_committed(
+                2,
+                named_parameters=_named(current),
+                masks={"w": torch.tensor([4], dtype=torch.int64)},
+            )
+
+        assert tracker.base_version == 1
+        encoded = tracker.encode(_named(current), 2)
+        assert encoded.changed_elements == 1
+
+    def test_snapshot_tracker_external_encode_refreshes_snapshot(self):
         base = {"w": torch.zeros(4, dtype=torch.bfloat16)}
         tracker = DeltaTracker()
         tracker.seed(_named(base), 1)
         current = {"w": base["w"].clone()}
         current["w"][0] = 1.0
 
-        with pytest.raises(RuntimeError, match="External masks.*store_snapshot=False"):
+        encoded = tracker.encode(
+            _named(current),
+            2,
+            masks={"w": torch.tensor([0], dtype=torch.int64)},
+        )
+        assert encoded.changed_elements == 1
+        assert tracker.base_version == 2
+
+        reverted = {"w": base["w"].clone()}
+        encoded = tracker.encode(_named(reverted), 3)
+        assert encoded.changed_elements == 1
+        assert tracker.base_version == 3
+
+    def test_snapshot_tracker_external_encode_requires_complete_masks(self):
+        base = {
+            "changed": torch.zeros(4, dtype=torch.bfloat16),
+            "unchanged": torch.zeros(4, dtype=torch.bfloat16),
+        }
+        tracker = DeltaTracker()
+        tracker.seed(_named(base), 1)
+        current = {name: value.clone() for name, value in base.items()}
+        current["changed"][0] = 1.0
+
+        with pytest.raises(ValueError, match=r"missing=\['unchanged'\]"):
             tracker.encode(
                 _named(current),
                 2,
-                masks={"w": torch.tensor([0], dtype=torch.int64)},
+                masks={"changed": torch.tensor([0], dtype=torch.int64)},
             )
 
         assert tracker.base_version == 1
