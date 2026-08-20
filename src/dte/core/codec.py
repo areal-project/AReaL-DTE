@@ -78,6 +78,17 @@ _INT_VIEW_DTYPE = {
 }
 _BIT_OFFSET_LOOKUP: dict[str, torch.Tensor] = {}
 
+_ParameterFlatLayoutKey = tuple[
+    str,
+    int | None,
+    int,
+    int,
+    torch.dtype,
+    torch.layout,
+    tuple[int, ...],
+    tuple[int, ...],
+]
+
 
 def _bit_offset_lookup(device: torch.device) -> torch.Tensor:
     """Return byte -> sorted set-bit offsets table for ``device``."""
@@ -475,6 +486,10 @@ class EncodedDelta:
         )
 
 
+class _AliasTopologyError(ValueError):
+    """Raised when current parameter aliasing differs from the seeded baseline."""
+
+
 class DeltaTracker:
     """Writer-side delta state: CPU baseline snapshot + version chain.
 
@@ -490,9 +505,11 @@ class DeltaTracker:
                 <group + serialize encoded.names / encoded.tensors>
 
     The snapshot lives in CPU pinned memory (one bf16 copy of the HF-converted
-    weights). Parameters sharing storage (tied embeddings) are deduplicated:
-    the snapshot holds a single CPU tensor and ``encode`` computes the delta
-    once, emitting it under every aliased name.
+    weights). Parameters sharing storage and logical flat layout (tied
+    embeddings) are deduplicated: the snapshot holds a single CPU tensor and
+    ``encode`` computes the delta once, emitting it under every aliased name.
+    This alias topology is part of the seeded baseline; callers must perform a
+    full sync and reseed if it changes.
     """
 
     def __init__(
@@ -515,6 +532,7 @@ class DeltaTracker:
         # Inversion mode (seed(store_snapshot=False)) keeps no CPU baseline; it
         # only records seen names so encode can tell known params from unknown.
         self._snapshot_names: set[str] = set()
+        self._snapshot_backed = False
         self._base_version: int | None = None
         self._deltas_since_anchor = 0
         self._force_full = False
@@ -538,6 +556,37 @@ class DeltaTracker:
                 seen_ptrs.add(ptr)
                 total += t.numel() * t.element_size()
         return total
+
+    @staticmethod
+    def _parameter_flat_layout_key(
+        tensor: torch.Tensor,
+    ) -> _ParameterFlatLayoutKey:
+        """Return the identity required to safely reuse flat-index encoding."""
+        data = tensor.detach()
+        return (
+            data.device.type,
+            data.device.index,
+            data.data_ptr(),
+            data.numel(),
+            data.dtype,
+            data.layout,
+            tuple(data.shape),
+            data.stride(),
+        )
+
+    @classmethod
+    def _current_alias_groups(
+        cls,
+        named_parameters: Iterable[tuple[str, torch.Tensor]],
+    ) -> list[list[str]]:
+        """Group parameters that share storage and logical flat-index layout."""
+        groups: dict[_ParameterFlatLayoutKey, list[str]] = {}
+        for name, param in named_parameters:
+            if param.numel() == 0:
+                continue
+            key = cls._parameter_flat_layout_key(param)
+            groups.setdefault(key, []).append(name)
+        return list(groups.values())
 
     def request_full_sync(self, reason: str = "external") -> None:
         """Force the next payload to be a full sync (e.g. reader requested)."""
@@ -572,29 +621,38 @@ class DeltaTracker:
                 (inversion detector) keep no baseline tensors — change masks come
                 from AdamW inversion, so we only record the seen names so
                 ``encode(masks=...)`` can distinguish known from unknown params.
+                A snapshot-free tracker must be reseeded before switching to
+                snapshot diff; snapshot-backed trackers may consume complete
+                external masks while keeping their baseline current. The tied
+                parameter topology captured here must stay stable until the next
+                full sync and seed.
         """
         start = time.time()
         self._snapshot.clear()
         self._snapshot_names.clear()
+        self._snapshot_backed = store_snapshot
         count = 0
         unique = 0
         if store_snapshot:
             # Dedup tied parameters: aliased names share one CPU tensor object.
-            by_storage: dict[tuple[int, int], torch.Tensor] = {}
+            by_flat_layout: dict[_ParameterFlatLayoutKey, torch.Tensor] = {}
             pin = torch.cuda.is_available()
             for name, param in named_parameters:
                 _check_reserved_names((name,))
                 data = param.detach()
-                key = (data.data_ptr(), data.numel())
-                cpu_tensor = by_storage.get(key)
+                # Empty tensors commonly share data_ptr=0 without being aliases.
+                # They carry no payload, so keep independent zero-byte snapshots.
+                key = self._parameter_flat_layout_key(data)
+                cpu_tensor = by_flat_layout.get(key) if data.numel() else None
                 if cpu_tensor is None:
                     cpu_tensor = data.contiguous().cpu().clone()
                     if pin:
                         cpu_tensor = cpu_tensor.pin_memory()
-                    by_storage[key] = cpu_tensor
+                    if data.numel():
+                        by_flat_layout[key] = cpu_tensor
+                    unique += 1
                 self._snapshot[name] = cpu_tensor
                 count += 1
-            unique = len(by_storage)
         else:
             for name, _ in named_parameters:
                 _check_reserved_names((name,))
@@ -615,6 +673,324 @@ class DeltaTracker:
             time.time() - start,
         )
 
+    def mark_delta_committed(
+        self,
+        version: int,
+        *,
+        named_parameters: Iterable[tuple[str, torch.Tensor]] | None = None,
+        masks: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        """Advance the version chain after an externally encoded delta succeeds.
+
+        Integrations which build and transfer sparse payloads without calling
+        :meth:`encode` must call this only after the payload is durably applied
+        by the receiver. For a snapshot-backed tracker, ``named_parameters`` and
+        the externally applied ``masks`` are required so this method can patch
+        the CPU baseline before advancing the version. ``masks`` may omit
+        unchanged parameters. In inversion mode
+        (``seed(..., store_snapshot=False)``), both remain optional because no
+        CPU snapshot exists. Failed transfers or invalid snapshot patches must
+        not advance the chain or the anchor counter. Because callers invoke
+        this method after receiver apply, any commit failure also forces the
+        next transfer to perform a full sync before the tracker can be reused.
+        """
+        if not self.seeded:
+            raise RuntimeError("DeltaTracker not seeded; run a full sync first.")
+        try:
+            reason = self.full_sync_reason(version)
+            if reason is not None:
+                raise RuntimeError(
+                    f"Delta version {version} requires a full sync ({reason})."
+                )
+            assert self._base_version is not None
+            expected_version = self._base_version + 1
+            if version != expected_version:
+                raise ValueError(
+                    "Committed delta version must be contiguous with the base: "
+                    f"base={self._base_version}, expected={expected_version}, "
+                    f"version={version}."
+                )
+
+            if self._snapshot_backed:
+                if named_parameters is None or masks is None:
+                    raise RuntimeError(
+                        "Snapshot-backed external commits require snapshot patch "
+                        "inputs: named_parameters and masks."
+                    )
+                updates = self._prepare_external_snapshot_updates(
+                    named_parameters,
+                    masks,
+                )
+                self._apply_external_snapshot_updates(updates)
+            elif named_parameters is not None or masks is not None:
+                raise ValueError(
+                    "Snapshot patch inputs are only valid for a snapshot-backed "
+                    "DeltaTracker."
+                )
+        except Exception:
+            # This API is called only after the receiver has durably applied the
+            # external payload. Even a local validation error therefore leaves
+            # the distributed state uncertain: fail closed and require a dense
+            # re-anchor before another delta can be encoded or committed.
+            if not self._force_full:
+                self.request_full_sync(f"external_commit_failed:{version}")
+            raise
+
+        self._base_version = version
+        self._deltas_since_anchor += 1
+        logger.info(
+            "DeltaTracker: externally committed delta version %d (%d since anchor)",
+            version,
+            self._deltas_since_anchor,
+        )
+
+    @torch.no_grad()
+    def _prepare_external_snapshot_updates(
+        self,
+        named_parameters: Iterable[tuple[str, torch.Tensor]],
+        masks: dict[str, torch.Tensor],
+        *,
+        require_complete_masks: bool = False,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Validate and stage sparse CPU snapshot patches without mutating state."""
+        params: dict[str, torch.Tensor] = {}
+        for name, param in named_parameters:
+            _check_reserved_names((name,))
+            if name in params:
+                raise ValueError(f"Duplicate external snapshot parameter: {name}")
+            params[name] = param
+
+        expected_names = set(self._snapshot)
+        param_names = set(params)
+        mask_names = set(masks)
+        if param_names != expected_names:
+            missing = sorted(expected_names - param_names)
+            extra = sorted(param_names - expected_names)
+            raise ValueError(
+                "External snapshot parameters do not match the stored snapshot: "
+                f"missing={missing}, extra={extra}."
+            )
+
+        extra_masks = sorted(mask_names - expected_names)
+        missing_masks = sorted(expected_names - mask_names)
+        if extra_masks or (require_complete_masks and missing_masks):
+            raise ValueError(
+                "External snapshot masks do not match the stored snapshot: "
+                f"missing={missing_masks if require_complete_masks else []}, "
+                f"extra={extra_masks}."
+            )
+
+        normalized_masks: dict[str, torch.Tensor] = {}
+        for name, current in params.items():
+            baseline = self._snapshot[name]
+            cur = current.detach().contiguous()
+            if baseline.dtype != cur.dtype or baseline.shape != cur.shape:
+                raise ValueError(
+                    f"External snapshot parameter mismatch for {name}: "
+                    f"snapshot=({baseline.shape}, {baseline.dtype}), "
+                    f"current=({cur.shape}, {cur.dtype})."
+                )
+
+            if name in masks:
+                normalized_masks[name] = self._normalize_external_mask_indices(
+                    name,
+                    masks[name],
+                    cur.numel(),
+                )
+
+        self._validate_snapshot_alias_topology(params)
+
+        aliases_by_snapshot: dict[int, list[str]] = {}
+        for name, baseline in self._snapshot.items():
+            if baseline.numel():
+                aliases_by_snapshot.setdefault(id(baseline), []).append(name)
+        for aliases in aliases_by_snapshot.values():
+            if len(aliases) < 2:
+                continue
+            present = [name for name in aliases if name in normalized_masks]
+            if present and len(present) != len(aliases):
+                missing = sorted(set(aliases) - set(present))
+                raise ValueError(
+                    "Tied snapshot aliases must appear together in external "
+                    f"masks: present={sorted(present)}, missing={missing}."
+                )
+            if not present:
+                continue
+
+            canonical = present[0]
+            canonical_indices = normalized_masks[canonical]
+            for alias in present[1:]:
+                if not torch.equal(canonical_indices, normalized_masks[alias]):
+                    raise ValueError(
+                        "Tied snapshot aliases must use equivalent external "
+                        f"masks: aliases={sorted(aliases)}."
+                    )
+
+        updates: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        staged_snapshots: set[int] = set()
+        for name, current in params.items():
+            if name not in normalized_masks:
+                continue
+            baseline = self._snapshot[name]
+            snapshot_id = id(baseline)
+            if snapshot_id in staged_snapshots:
+                continue
+            staged_snapshots.add(snapshot_id)
+
+            cpu_indices = normalized_masks[name]
+            if cpu_indices.numel() == 0:
+                continue
+            cur = current.detach().contiguous()
+            indices = cpu_indices.to(cur.device, non_blocking=False)
+            flat_baseline = baseline.reshape(-1)
+            old_values = flat_baseline.index_select(0, cpu_indices).clone()
+            new_values = (
+                cur.reshape(-1)
+                .index_select(0, indices)
+                .to("cpu", non_blocking=False)
+                .clone()
+            )
+            updates.append((baseline, cpu_indices, new_values, old_values))
+        return updates
+
+    def _validate_snapshot_alias_topology(
+        self,
+        params: dict[str, torch.Tensor],
+    ) -> None:
+        """Require seed-time and current alias partitions to remain equivalent."""
+        snapshot_groups: dict[int, list[str]] = {}
+        for name, baseline in self._snapshot.items():
+            if baseline.numel():
+                snapshot_groups.setdefault(id(baseline), []).append(name)
+
+        for aliases in snapshot_groups.values():
+            if len(aliases) < 2:
+                continue
+            missing = sorted(set(aliases) - set(params))
+            if missing:
+                raise _AliasTopologyError(
+                    "Snapshot alias topology changed: tied parameters are missing "
+                    f"from the current set: aliases={sorted(aliases)}, "
+                    f"missing={missing}; perform a full sync and reseed."
+                )
+            current_keys = {
+                self._parameter_flat_layout_key(params[name]) for name in aliases
+            }
+            if len(current_keys) != 1:
+                raise _AliasTopologyError(
+                    "Snapshot alias topology changed: parameters tied when seeded "
+                    "no longer share storage and logical flat layout: "
+                    f"aliases={sorted(aliases)}; "
+                    "perform a full sync and reseed."
+                )
+
+        for aliases in self._current_alias_groups(params.items()):
+            known = [name for name in aliases if name in self._snapshot]
+            if len(known) < 2:
+                continue
+            snapshot_ids = {id(self._snapshot[name]) for name in known}
+            if len(snapshot_ids) != 1:
+                raise _AliasTopologyError(
+                    "Snapshot alias topology changed: parameters separate when "
+                    "seeded now share storage and logical flat layout: "
+                    f"aliases={sorted(known)}; "
+                    "perform a full sync and reseed."
+                )
+
+    def _validate_current_external_alias_masks(
+        self,
+        named_parameters: list[tuple[str, torch.Tensor]],
+        masks: dict[str, torch.Tensor],
+    ) -> None:
+        """Validate masks for aliases whose encoded result may be reused."""
+        params = dict(named_parameters)
+        known_names = (
+            set(self._snapshot) if self._snapshot_backed else self._snapshot_names
+        )
+        for aliases in self._current_alias_groups(named_parameters):
+            if len(aliases) < 2:
+                continue
+            normalized: dict[str, torch.Tensor] = {}
+            for name in aliases:
+                if name not in known_names or name not in masks:
+                    continue
+                try:
+                    normalized[name] = self._normalize_external_mask_indices(
+                        name,
+                        masks[name],
+                        params[name].numel(),
+                    )
+                except (TypeError, ValueError):
+                    # The encode loop sends an unusable mask as dense before it
+                    # reaches tied-result reuse. Only usable masks can conflict.
+                    continue
+            if len(normalized) < 2:
+                continue
+            canonical, *rest = normalized
+            canonical_indices = normalized[canonical]
+            for alias in rest:
+                if not torch.equal(canonical_indices, normalized[alias]):
+                    raise ValueError(
+                        "Current tied parameter aliases must use equivalent "
+                        f"external masks: aliases={sorted(normalized)}."
+                    )
+
+    @staticmethod
+    def _normalize_external_mask_indices(
+        name: str,
+        mask: torch.Tensor,
+        numel: int,
+    ) -> torch.Tensor:
+        """Return a sorted unique CPU index set for alias-safe comparison."""
+        if not isinstance(mask, torch.Tensor):
+            raise TypeError(
+                f"External snapshot mask for {name} must be a tensor, "
+                f"got {type(mask).__name__}."
+            )
+        if mask.dtype == torch.bool:
+            if mask.numel() != numel:
+                raise ValueError(
+                    f"External snapshot bool mask size mismatch for {name}: "
+                    f"mask={mask.numel()}, parameter={numel}."
+                )
+            indices = mask.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+        elif mask.dtype in {torch.int32, torch.int64}:
+            indices = mask.to(dtype=torch.long).reshape(-1)
+            if indices.numel() and bool(
+                ((indices < 0) | (indices >= numel)).any().item()
+            ):
+                raise ValueError(f"External snapshot indices out of range for {name}.")
+        else:
+            raise TypeError(
+                f"External snapshot mask for {name} must be bool, int32, "
+                f"or int64, got {mask.dtype}."
+            )
+        return torch.unique(
+            indices.to("cpu", dtype=torch.long, non_blocking=False),
+            sorted=True,
+        )
+
+    @staticmethod
+    @torch.no_grad()
+    def _apply_external_snapshot_updates(
+        updates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Apply prepared patches and roll back all prior writes on failure."""
+        applied: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        try:
+            for update in updates:
+                baseline, indices, new_values, _ = update
+                baseline.reshape(-1).index_copy_(0, indices, new_values)
+                applied.append(update)
+        except Exception:
+            for baseline, indices, _, old_values in reversed(applied):
+                baseline.reshape(-1).index_copy_(0, indices, old_values)
+            raise
+
     @torch.no_grad()
     def encode(
         self,
@@ -631,24 +1007,60 @@ class DeltaTracker:
             version: The payload (target) version; becomes the new base.
             masks: optional ``{hf_name: bool change mask}`` from an external
                 detector (AdamW inversion). When provided, the change mask comes
-                from ``masks`` instead of an internal snapshot diff, and the CPU
-                snapshot is NOT refreshed (inversion mode keeps no baseline). A
-                name missing from ``masks`` falls back to dense. When ``masks``
-                is None the behaviour is byte-identical to the snapshot path.
+                from ``masks`` instead of an internal snapshot diff. In inversion
+                mode the tracker keeps no baseline. A snapshot-backed tracker
+                requires one mask entry for every snapshot parameter and patches
+                its baseline before committing the version. A name missing from
+                ``masks`` falls back to dense only in inversion mode. When
+                ``masks`` is None the snapshot detector is used; a snapshot-free
+                tracker must be reseeded with ``store_snapshot=True`` before
+                selecting that path. External masks for current tied aliases
+                must represent equivalent index sets because their encoded
+                result is shared.
 
-        The snapshot is refreshed in place (snapshot mode only), so after this
-        call the tracker's base is ``version``.
+        When the tracker has a snapshot, its baseline is refreshed in place, so
+        after this call the tracker's base is ``version``. A pending anchor or
+        requested full sync must be resolved by reseeding before this method can
+        encode another delta.
         """
         if not self.seeded:
             raise RuntimeError("DeltaTracker not seeded; run a full sync first.")
+        reason = self.full_sync_reason(version)
+        if reason is not None:
+            raise RuntimeError(
+                f"Delta version {version} requires a full sync ({reason})."
+            )
 
         external = masks is not None
+        if not self._snapshot_backed and not external:
+            raise RuntimeError(
+                "Snapshot diff requires a tracker seeded with "
+                "store_snapshot=True; external/inversion trackers must provide "
+                "masks or be reseeded."
+            )
+        named_parameters = list(named_parameters)
+        snapshot_updates = None
+        try:
+            if self._snapshot_backed and external:
+                snapshot_updates = self._prepare_external_snapshot_updates(
+                    named_parameters,
+                    masks,
+                    require_complete_masks=True,
+                )
+            elif self._snapshot_backed:
+                self._validate_snapshot_alias_topology(dict(named_parameters))
+        except _AliasTopologyError:
+            self.request_full_sync("alias_topology_changed")
+            raise
+        if external:
+            self._validate_current_external_alias_masks(named_parameters, masks)
         start = time.time()
         result = EncodedDelta()
         # Per-call dedup for tied params: same storage -> compute once, emit
-        # the same idx/val tensors under every aliased name.
+        # the same idx/val tensors under aliases with the same logical layout.
         computed: dict[
-            tuple[int, int], tuple[str, tuple[torch.Tensor, torch.Tensor] | None]
+            _ParameterFlatLayoutKey,
+            tuple[str, tuple[torch.Tensor, torch.Tensor] | None],
         ] = {}
         header_device: torch.device | None = None
 
@@ -668,7 +1080,11 @@ class DeltaTracker:
             # Resolve the change mask source: external detector vs snapshot.
             ext_indices: torch.Tensor | None = None
             if external:
-                known = name in self._snapshot_names
+                known = (
+                    name in self._snapshot
+                    if self._snapshot_backed
+                    else name in self._snapshot_names
+                )
                 ext_mask = masks.get(name)
                 bad = ext_mask is None
                 if ext_mask is not None and not bad:
@@ -708,7 +1124,7 @@ class DeltaTracker:
                     self._emit_dense(result, name, cur, numel, dense_bytes)
                     continue
 
-            key = (param.detach().data_ptr(), numel)
+            key = self._parameter_flat_layout_key(param)
             if key in computed:
                 # Tied parameter alias: reuse the canonical result.
                 canonical, sparse = computed[key]
@@ -769,6 +1185,8 @@ class DeltaTracker:
         result.names.insert(0, DELTA_HEADER_NAME)
         result.tensors.insert(0, result.header.to_tensor(device=header_device))
 
+        if snapshot_updates is not None:
+            self._apply_external_snapshot_updates(snapshot_updates)
         self._base_version = version
         self._deltas_since_anchor += 1
         logger.info(
