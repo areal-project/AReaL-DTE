@@ -25,6 +25,18 @@ If your change touches the awex backend, also update or run the GPU parity steps
 `docs/awex-gpu-verification.md`. CPU tests cannot prove NCCL process-group, MetaServer,
 or colocate runtime behavior.
 
+For staged HTTP transport changes, run the focused CPU suite as well:
+
+```bash
+python -m pytest tests/test_http_backend*.py tests/test_engine.py -q
+```
+
+Keep tests centered on transport contracts: publication visibility, writer-scoped
+checksums, bounded fetching, retention, and reconstruction after partial failure. Prefer
+shared scenarios over duplicate happy-path tests, and assert specific failure types
+rather than accepting any exception. CPU fixtures do not validate live provider
+authentication, network performance, or an inference engine's reload/ACK lifecycle.
+
 ## Pull requests
 
 - Keep algorithm changes in `src/dte/core` independent of transport backends unless the

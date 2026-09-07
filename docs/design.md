@@ -59,6 +59,25 @@ exchange，本地 self-copy 和 cross-rank P2P 在同一个调用里完成，所
 
 这个边界让 CPU 单测能覆盖算法主体。真正依赖集群的部分只剩 backend integration。
 
+### 1.3 Staged blob backend
+
+`HttpTransport` 不要求 sender 和 receiver 之间存在实时连接。每个 writer 把当前 anchor 或 delta 写成
+zstd-compressed safetensors chunk，通过 `BlobStore` 暂存到共享文件系统或 S3-compatible object
+store。文件和 tensor checksum 都按 writer 作用域记录，因此不同 writer 可以安全地发布同名参数 shard。
+
+Writer 先原子写 payload，再发布自己的完成 marker；rank 0 收齐所有 writer metadata 后最后 写 version manifest 和
+`latest.json`。Reader 只有在 manifest 完整时才把版本视为已提交，也可以 通过 writer marker 提前流式应用已经完成的 shard。新的
+full anchor 提交后会删除更早的 anchor 和 delta，从而限制 store 占用。
+
+`DeltaEngine.reconstruct_stream` 逐 chunk 重建 receiver base。每个 sparse 参数的
+`@delta_idx`/`@delta_val` 必须位于同一 chunk；中途失败会使 version chain 保持未提交状态，下一次 delta
+因此不能错误地应用到部分更新的 base 上。
+
+Store 需要是受信任的目录或 bucket，调用方负责写入权限、版本单调发布和 shard 路由。 Manifest 的 `writers` 数组按 writer rank
+保存 files、tensor checksums 和可选 full-state checksums；此结构不兼容将 checksums 按全局参数名扁平合并的早期原型。 同名
+shard 可以分别校验与拉取，但一个 `reconstruct_stream` 的 base 以参数名索引，因此输入必须 先由调用方路由成不重名的完整参数。Early
+apply 期间应暂停推理，并在所有 writer 完成且 manifest 可见后发布新模型版本；流式重建本身不会轮询 manifest。
+
 ## 2. 生命周期
 
 ```mermaid
@@ -318,6 +337,8 @@ delta 只传 changed 元素。runtime 如果 release 后不能恢复完整 param
 - colocate P2P payload 构造、zero-nnz 对称性、dtype 分组；
 - `DeltaEngine` 的 full/delta/anchor/no-op/chain-break 路径；
 - loopback、awex 适配器契约、Mooncake pack/unpack。
+- HTTP staged transport 的 shared-filesystem、multi-writer manifest、checksum、chunk
+  streaming 和中断后的 version-chain 行为。
 
 集群侧：
 

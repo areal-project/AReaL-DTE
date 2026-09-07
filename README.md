@@ -220,6 +220,8 @@ buffers. Zero-`nnz` ops still participate so every rank walks the same schedule.
   scheduling.
 - `src/dte/backends/mooncake_backend.py`: Mooncake/RDMA-oriented packing path and
   transport interface.
+- `src/dte/backends/http_backend.py`: staged shared-filesystem or S3-compatible blob
+  transport with atomic manifests, checksums, and bounded-memory streaming.
 - `docs/design.md`: full design, equations, protocol invariants, and validation notes.
 - `docs/awex-gpu-verification.md`: GPU parity checklist for `AwexTransport`.
 
@@ -247,6 +249,8 @@ Optional transport backends:
 ```bash
 python -m pip install -e ".[awex]"      # dingzhiqiang/asystem-awex + NCCL runtime
 python -m pip install -e ".[mooncake]"  # Mooncake Transfer Engine
+python -m pip install -e ".[http]"      # Shared-filesystem staged transport
+python -m pip install -e ".[http,s3]"   # Add the S3-compatible store provider
 ```
 
 The default install is enough for the core algorithm and the loopback backend. Cluster
@@ -277,6 +281,38 @@ force periodic full anchors. `mode="full"` skips detection and sends dense weigh
 step. The standalone engine uses snapshot diff unless an integration supplies external
 masks; the AReaL examples supply AdamW-inversion masks by default.
 
+For processes that do not share a live communication fabric, the HTTP backend stages
+each version as immutable blobs on a shared filesystem or S3-compatible object store:
+
+```python
+from dte import DeltaEngine
+from dte.backends import HttpTransport, SharedFSStore
+
+store = SharedFSStore("/mnt/weights")
+
+# Trainer process. Full payloads are headerless, so begin() supplies their version.
+sender = DeltaEngine(HttpTransport(store, stream="run-1"))
+sender.transport.begin(step)
+sender.push(model.named_parameters(), version=step)
+
+# Rollout process on any host that can read the same store.
+receiver = DeltaEngine(HttpTransport(store, stream="run-1"))
+receiver.pull(target_params, version=step)
+```
+
+Payloads use zstd-compressed safetensors with file- and tensor-level checksums. A
+manifest commits the complete version atomically; chunked publish/fetch and
+`DeltaEngine.reconstruct_stream` keep peak staging memory bounded for large models.
+
+Keep sender and receiver instances alive across steps. The example uses a single writer
+and assumes the caller waits for publication and consumes each version in order.
+`recv()` polls the latest version once; it does not replay skipped deltas. For multiple
+writers, use `publish` / `write_manifest` / `iter_fetch`. The application owns shard
+routing; one `reconstruct_stream` requires unique parameter names across writers. Early
+writer-marker reads still require waiting for the final manifest before exposing the new
+model to inference. New anchors prune older versions, so readers racing retention must
+reload the current anchor.
+
 ## Development
 
 ```bash
@@ -301,6 +337,7 @@ separately in `docs/awex-gpu-verification.md`.
 | `loopback` backend   | Local test backend.                                                                                                                                                                              |
 | `awex` backend       | Adapter uses `dingzhiqiang/asystem-awex`; the colocated sparse path supports coalesced two-round metadata/data exchange. Live cross-rank parity still needs NCCL + MetaServer + megatron/sglang. |
 | `mooncake` backend   | Interface and pack/unpack path are present. RDMA execution needs a Mooncake runtime.                                                                                                             |
+| `http` backend       | Shared-filesystem behavior, multi-writer manifests, chunk streaming, retention, corruption handling, and S3 contracts have CPU tests.                                                            |
 
 ## License
 
