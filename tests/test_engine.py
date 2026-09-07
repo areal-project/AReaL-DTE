@@ -356,3 +356,267 @@ def test_reconstruct_delta_before_base_raises_chain_broken():
     fresh = DeltaEngine(transport=None)  # no base
     with pytest.raises(DeltaChainBroken):
         fresh.reconstruct(named, 1)
+
+
+# ---------------------------------------------------------------------------
+# DeltaEngine.reconstruct_stream (receiver-only, chunk-fed; pairs with
+# HttpTransport.iter_fetch so the http tensor applier never materializes the
+# whole payload or the whole reconstructed result at once).
+# ---------------------------------------------------------------------------
+from dte.core import DELTA_HEADER_NAME  # noqa: E402
+
+
+def _split_chunks(named, sizes):
+    """Split a wire dict into chunk dicts of the given entry counts (order
+    preserved, so idx/val pairs stay together when sizes respect groups)."""
+    items = list(named.items())
+    chunks, at = [], 0
+    for n in sizes:
+        chunks.append(dict(items[at : at + n]))
+        at += n
+    assert at == len(items), "sizes must cover every entry"
+    return chunks
+
+
+def test_stream_full_sync_seeds_base_and_yields_everything():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {
+        "a": torch.randn(4, 8, dtype=torch.bfloat16),
+        "b": torch.randn(16, dtype=torch.bfloat16),
+        "c": torch.randn(3, dtype=torch.float32),
+    }
+    named = _wire(sender, transport, w, 0)  # full sync: 3 plain entries
+
+    got = {}
+    for out in recv.reconstruct_stream(_split_chunks(named, [2, 1]), 0):
+        got.update(out)
+    assert set(got) == set(w)
+    for k in w:
+        assert torch.equal(got[k], w[k])
+    assert recv.base_version == 0
+    # base was seeded (a later delta must chain off it)
+    assert set(recv._base) == set(w)
+
+
+def test_stream_delta_yields_only_changed_and_chains():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {
+        "a": torch.randn(4, 8, dtype=torch.bfloat16),
+        "b": torch.randn(16, dtype=torch.bfloat16),
+    }  # b stays unchanged
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+
+    w2 = _clone(w)
+    w2["a"].view(-1)[3] = 1.5
+    w2["a"].view(-1)[10] = -2.25
+    named = _wire(sender, transport, w2, 1)
+    # delta wire: header + a@delta_idx + a@delta_val -> header-only chunk first
+    chunks = _split_chunks(named, [1, 2])
+
+    got = {}
+    for out in recv.reconstruct_stream(chunks, 1):
+        got.update(out)
+    assert set(got) == {"a"}, "unchanged param must not be yielded"
+    assert torch.equal(got["a"], w2["a"])
+    assert recv.base_version == 1
+
+    # base advanced in place: a further delta chains cleanly
+    w3 = _clone(w2)
+    w3["b"].view(-1)[0] = 7.0
+    got3 = {}
+    for out in recv.reconstruct_stream([_wire(sender, transport, w3, 2)], 2):
+        got3.update(out)
+    assert set(got3) == {"b"}
+    assert torch.equal(got3["b"], w3["b"])
+    assert recv.base_version == 2
+
+
+def test_stream_accepts_payload_lists():
+    from dte.transport import Payload
+
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {"a": torch.randn(8, dtype=torch.bfloat16)}
+    named = _wire(sender, transport, w, 0)
+    chunks = [[Payload(k, v) for k, v in named.items()]]  # iter_fetch shape
+    got = {}
+    for out in recv.reconstruct_stream(chunks, 0):
+        got.update(out)
+    assert torch.equal(got["a"], w["a"])
+    assert recv.base_version == 0
+
+
+def test_stream_delta_chain_broken_before_touching_base():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {"a": torch.randn(8, dtype=torch.bfloat16)}
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+    w2 = _clone(w)
+    w2["a"][1] = 9.0
+    _wire(sender, transport, w2, 1)  # sender advances to v1; receiver misses it
+    w3 = _clone(w2)
+    w3["a"][2] = 8.0
+    named_v2 = _wire(sender, transport, w3, 2)  # base_version=1 != receiver 0
+
+    # chain check is eager: raises at call time, before any chunk is read
+    with pytest.raises(DeltaChainBroken):
+        recv.reconstruct_stream([named_v2], 2)
+    # failed before touching anything: receiver base still intact at v0
+    assert recv.base_version == 0
+
+
+def test_stream_midway_failure_invalidates_version():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {
+        "a": torch.randn(8, dtype=torch.bfloat16),
+        "b": torch.randn(8, dtype=torch.bfloat16),
+    }
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+
+    w2 = _clone(w)
+    w2["a"][1] = 9.0
+    w2["b"][2] = -3.0
+    named = _wire(sender, transport, w2, 1)  # header + two sparse pairs
+
+    def broken_chunks():
+        chunks = _split_chunks(named, [3, 2])  # header+pair, pair
+        yield chunks[0]
+        raise OSError("store read failed mid-stream")
+
+    gen = recv.reconstruct_stream(broken_chunks(), 1)
+    next(gen)  # first chunk applies
+    with pytest.raises(IOError):
+        next(gen)
+    # base may be partially patched -> version must be invalidated so the
+    # next delta breaks the chain and forces a fresh anchor.
+    assert recv.base_version is None
+    w3 = _clone(w2)
+    w3["a"][0] = 1.0
+    named3 = _wire(sender, transport, w3, 2)
+    with pytest.raises(DeltaChainBroken):
+        list(recv.reconstruct_stream([named3], 2))
+
+
+def test_stream_abandoned_generator_does_not_advance_version():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {
+        "a": torch.randn(8, dtype=torch.bfloat16),
+        "b": torch.randn(8, dtype=torch.bfloat16),
+    }
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+
+    w2 = _clone(w)
+    w2["a"][1] = 9.0
+    w2["b"][2] = -3.0
+    named = _wire(sender, transport, w2, 1)
+    gen = recv.reconstruct_stream(_split_chunks(named, [3, 2]), 1)
+    next(gen)
+    gen.close()  # caller walks away mid-stream
+    assert recv.base_version is None, "abandoned apply must not look committed"
+
+
+def test_stream_count_mismatch_raises_and_invalidates():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {
+        "a": torch.randn(8, dtype=torch.bfloat16),
+        "b": torch.randn(8, dtype=torch.bfloat16),
+    }
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+
+    w2 = _clone(w)
+    w2["a"][1] = 9.0
+    w2["b"][2] = -3.0
+    named = _wire(sender, transport, w2, 1)
+    chunks = _split_chunks(named, [3, 2])[:1]  # second chunk silently dropped
+
+    with pytest.raises(ValueError, match="count mismatch"):
+        list(recv.reconstruct_stream(chunks, 1))
+    assert recv.base_version is None
+
+
+def test_stream_sparse_param_absent_from_base_raises():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {"a": torch.randn(8, dtype=torch.bfloat16)}
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+    w2 = _clone(w)
+    w2["a"][1] = 9.0
+    named = _wire(sender, transport, w2, 1)
+    # rename the sparse pair to a param the receiver never saw
+    renamed = {
+        (k.replace("a@", "ghost@") if k != DELTA_HEADER_NAME else k): v
+        for k, v in named.items()
+    }
+    with pytest.raises(ValueError, match="absent from base"):
+        list(recv.reconstruct_stream([renamed], 1))
+    assert recv.base_version is None
+
+
+def test_stream_unpaired_sparse_entry_raises():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {"a": torch.randn(8, dtype=torch.bfloat16)}
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 0)], 0))
+    w2 = _clone(w)
+    w2["a"][1] = 9.0
+    named = _wire(sender, transport, w2, 1)
+    named.pop("a@delta_val")  # idx without val inside one chunk
+    with pytest.raises(ValueError, match="unpaired"):
+        list(recv.reconstruct_stream([named], 1))
+
+
+def test_stream_stale_full_sync_raises():
+    sender, _, transport = _make_pair()
+    recv = DeltaEngine(transport=None)
+    w = {"a": torch.randn(8, dtype=torch.bfloat16)}
+    list(recv.reconstruct_stream([_wire(sender, transport, w, 5)], 5))
+    # a fresh sender is never seeded, so its push is always a full sync
+    sender2, _, transport2 = _make_pair()
+    stale = _wire(sender2, transport2, w, 3)
+    with pytest.raises(DeltaChainBroken, match="older"):
+        recv.reconstruct_stream([stale], 3)
+    assert recv.base_version == 5
+
+
+def test_stream_multi_writer_headers_sum_counts():
+    s1, _, t1 = _make_pair()
+    s2, _, t2 = _make_pair()
+    recv = DeltaEngine(transport=None)
+    wa = {"a": torch.randn(8, dtype=torch.bfloat16)}
+    wb = {"b": torch.randn(8, dtype=torch.bfloat16)}
+    seed = {**_wire(s1, t1, wa, 0), **_wire(s2, t2, wb, 0)}
+    list(recv.reconstruct_stream([seed], 0))
+
+    wa2 = _clone(wa)
+    wa2["a"][1] = 9.0
+    wb2 = _clone(wb)
+    wb2["b"][2] = -3.0
+    chunk_a = _wire(s1, t1, wa2, 1)
+    chunk_b = _wire(s2, t2, wb2, 1)
+
+    got = {}
+    for out in recv.reconstruct_stream([chunk_a, chunk_b], 1):
+        got.update(out)
+    assert set(got) == {"a", "b"}
+    assert torch.equal(got["a"], wa2["a"])
+    assert torch.equal(got["b"], wb2["b"])
+    assert recv.base_version == 1
+
+
+def test_stream_empty_raises():
+    recv = DeltaEngine(transport=None)
+    with pytest.raises(ValueError, match="empty"):
+        list(recv.reconstruct_stream([], 0))
+
+
+# Streaming callers must route same-name shards before reconstruction.
+def test_stream_full_duplicate_name_invalidates_base():
+    recv = DeltaEngine(None)
+    with pytest.raises(ValueError, match="unique parameter names"):
+        list(recv.reconstruct_stream([{"w": torch.ones(2)}, {"w": torch.zeros(2)}], 0))
+    assert recv.base_version is None

@@ -23,3 +23,12 @@ try:  # optional: pip install delta-transfer-engine[mooncake]
     __all__ += ["MooncakeTransport"]
 except Exception:  # pragma: no cover - missing mooncake or its deps
     MooncakeTransport = None
+
+try:  # optional: pip install delta-transfer-engine[http]
+    from dte.backends.http_backend import HttpTransport, S3Store, SharedFSStore
+
+    __all__ += ["HttpTransport", "SharedFSStore", "S3Store"]
+except Exception:  # pragma: no cover - missing serialization or store dependencies
+    HttpTransport = None
+    SharedFSStore = None
+    S3Store = None

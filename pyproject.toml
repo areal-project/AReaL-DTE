@@ -37,7 +37,11 @@ Issues = "https://github.com/areal-project/AReaL-DTE/issues"
 awex = ["awex @ git+https://github.com/dingzhiqiang/asystem-awex.git@main"]
 # `mooncake-transfer-engine` is the Mooncake Transfer Engine PyPI distribution.
 mooncake = ["mooncake-transfer-engine"]  # disaggregated RDMA put/get
+http = ["blake3", "safetensors", "xxhash", "zstandard"]
+s3 = ["boto3"]  # S3-compatible provider for the staged HTTP backend
 dev = [
+    "blake3",
+    "boto3",
     "build>=1.2",
     "mdformat==0.7.17",
     "mdformat-gfm",
@@ -46,6 +50,10 @@ dev = [
     "pytest>=7.0",
     "pytest-xdist",
     "ruff==0.14.9",
+    "moto[s3]>=5.0",
+    "safetensors",
+    "xxhash",
+    "zstandard",
 ]
 
 [tool.setuptools.packages.find]
