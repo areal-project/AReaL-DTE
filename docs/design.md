@@ -67,7 +67,8 @@ store。文件和 tensor checksum 都按 writer 作用域记录，因此不同 w
 
 Writer 先原子写 payload，再发布自己的完成 marker；rank 0 收齐所有 writer metadata 后最后 写 version manifest 和
 `latest.json`。Reader 只有在 manifest 完整时才把版本视为已提交，也可以 通过 writer marker 提前流式应用已经完成的 shard。新的
-full anchor 提交后会删除更早的 anchor 和 delta，从而限制 store 占用。
+full anchor 默认会删除更早的 anchor 和 delta；`prune_on_anchor=False` 可关闭自动删除， 让应用为慢 reader
+保留版本并单独运行清理。
 
 `DeltaEngine.reconstruct_stream` 逐 chunk 重建 receiver base。每个 sparse 参数的
 `@delta_idx`/`@delta_val` 必须位于同一 chunk；中途失败会使 version chain 保持未提交状态，下一次 delta
@@ -77,6 +78,11 @@ Store 需要是受信任的目录或 bucket，调用方负责写入权限、版�
 保存 files、tensor checksums 和可选 full-state checksums；此结构不兼容将 checksums 按全局参数名扁平合并的早期原型。 同名
 shard 可以分别校验与拉取，但一个 `reconstruct_stream` 的 base 以参数名索引，因此输入必须 先由调用方路由成不重名的完整参数。Early
 apply 期间应暂停推理，并在所有 writer 完成且 manifest 可见后发布新模型版本；流式重建本身不会轮询 manifest。
+
+原生 OSS 使用 `OSSStore` 实现相同 `BlobStore` 契约。应用注入已经初始化的 `oss2.Bucket`， 明确选择 endpoint
+和签名模式；provider 不探测或自动降级签名。所有 key 限制在独立 run prefix。 普通对象使用 PUT/GET，大对象通过 multipart 的
+complete 操作提交；失败的 multipart 保留为未完成 上传，由应用清理。Reader 完成读取后关闭响应以释放连接。仅 `NoSuchKey`
+被映射为对象不存在， 鉴权失败、bucket 不存在和网络错误继续向调用方传播。
 
 ## 2. 生命周期
 

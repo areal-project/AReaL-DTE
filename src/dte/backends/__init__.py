@@ -7,8 +7,9 @@ it needs) is missing, ``AwexTransport`` is ``None`` instead of raising at import
 """
 
 from dte.backends.loopback import LoopbackTransport
+from dte.backends.oss_store import OSSStore
 
-__all__ = ["LoopbackTransport"]
+__all__ = ["LoopbackTransport", "OSSStore"]
 
 try:  # optional: pip install delta-transfer-engine[awex]
     from dte.backends.awex_backend import AwexTransport

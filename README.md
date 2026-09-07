@@ -251,6 +251,7 @@ python -m pip install -e ".[awex]"      # dingzhiqiang/asystem-awex + NCCL runti
 python -m pip install -e ".[mooncake]"  # Mooncake Transfer Engine
 python -m pip install -e ".[http]"      # Shared-filesystem staged transport
 python -m pip install -e ".[http,s3]"   # Add the S3-compatible store provider
+python -m pip install -e ".[http,oss]"  # Add the native Alibaba Cloud OSS provider
 ```
 
 The default install is enough for the core algorithm and the loopback backend. Cluster
@@ -312,6 +313,24 @@ routing; one `reconstruct_stream` requires unique parameter names across writers
 writer-marker reads still require waiting for the final manifest before exposing the new
 model to inference. New anchors prune older versions, so readers racing retention must
 reload the current anchor.
+
+For native OSS, inject an initialized `oss2.Bucket` into `OSSStore`. Authentication,
+region, endpoint, credentials, and SDK connection settings remain application-owned:
+
+```python
+from dte.backends import HttpTransport, OSSStore
+
+# oss_bucket is an application-configured oss2.Bucket with V2 or V4 authentication.
+store = OSSStore(bucket_client=oss_bucket, prefix="dte/run-1")
+transport = HttpTransport(store, stream="policy", prune_on_anchor=False)
+```
+
+`prune_on_anchor=False` retains older versions for application-managed cleanup. The
+default remains `True` for compatibility. Native OSS reads and writes use memory
+buffers, with no local staging files. Blobs of at least 64 MiB use sequential multipart
+uploads (configurable); multipart does not remove the need to hold the packed blob in
+memory. An interrupted upload does not commit an object; incomplete uploads require
+separate cleanup. Credentials and deployment-specific endpoints never belong in code.
 
 ## Development
 
