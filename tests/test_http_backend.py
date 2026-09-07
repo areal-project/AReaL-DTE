@@ -374,8 +374,9 @@ def test_oversized_single_tensor_forms_own_chunk(tmp_path):
     assert out == {"big", "small"}
 
 
-def test_anchor_commit_prunes_older_versions(tmp_path):
-    t = _mk(tmp_path)
+@pytest.mark.parametrize("prune_on_anchor", [True, False])
+def test_anchor_retention_preserves_chain_until_pruned(tmp_path, prune_on_anchor):
+    t = _mk(tmp_path, prune_on_anchor=prune_on_anchor)
     store = SharedFSStore(str(tmp_path))
     t.publish(1, [Payload("w", torch.ones(4, dtype=torch.float32))], anchor=True)
     for v in (2, 3):
@@ -388,10 +389,12 @@ def test_anchor_commit_prunes_older_versions(tmp_path):
             anchor=False,
         )
     assert t.list_versions() == ([1], [2, 3])
-    # New anchor at v4 -> v1..v3 pruned, only v4 remains.
     t.publish(
         4, [Payload("w", torch.full((4,), 4.0, dtype=torch.float32))], anchor=True
     )
+    if not prune_on_anchor:
+        assert t.list_versions() == ([1, 4], [2, 3])
+        assert t.prune_versions_before(4) == 3
     assert t.list_versions() == ([4], [])
     assert not store.list_keys("s/anchors/v000001/")
     assert not store.list_keys("s/deltas/")

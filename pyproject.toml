@@ -39,6 +39,7 @@ awex = ["awex @ git+https://github.com/dingzhiqiang/asystem-awex.git@main"]
 mooncake = ["mooncake-transfer-engine"]  # disaggregated RDMA put/get
 http = ["blake3", "safetensors", "xxhash", "zstandard"]
 s3 = ["boto3"]  # S3-compatible provider for the staged HTTP backend
+oss = ["oss2>=2.19.0"]  # Native OSS provider; combine with the http extra
 dev = [
     "blake3",
     "boto3",
@@ -51,6 +52,7 @@ dev = [
     "pytest-xdist",
     "ruff==0.14.9",
     "moto[s3]>=5.0",
+    "oss2>=2.19.0",
     "safetensors",
     "xxhash",
     "zstandard",

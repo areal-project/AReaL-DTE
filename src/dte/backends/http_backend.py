@@ -371,6 +371,7 @@ class HttpTransport(Transport):
         writer_rank: int = 0,
         num_writers: int = 1,
         checksum: str = "xxh3-128",
+        prune_on_anchor: bool = True,
     ) -> None:
         _validate_blob_key(stream)
         if num_writers < 1:
@@ -386,6 +387,8 @@ class HttpTransport(Transport):
         self.writer_rank = writer_rank
         self.num_writers = num_writers
         self.checksum = checksum
+        # TODO(agent): Retention is application-owned when readers can lag anchors.
+        self.prune_on_anchor = prune_on_anchor
         self._begin_version: int | None = None
         self._pulled_version: int | None = None
 
@@ -617,8 +620,8 @@ class HttpTransport(Transport):
     ) -> None:
         """Aggregate writers' metadata into the version manifest, then commit
         ``latest.json`` — strictly in that order: the manifest must be complete
-        before any reader can discover the version. Committing an anchor then
-        prunes every older version (see :meth:`prune_versions_before`)."""
+        before any reader can discover the version. Unless ``prune_on_anchor``
+        is disabled, an anchor prunes older versions (see :meth:`prune_versions_before`)."""
         if self.writer_rank != 0:
             raise RuntimeError(
                 f"write_manifest must run on writer_rank 0, not {self.writer_rank}"
@@ -665,7 +668,7 @@ class HttpTransport(Transport):
         )
         latest = {"schema": 1, "version": version, "kind": kind, "dir": vdir}
         self.store.put_bytes(f"{self.stream}/latest.json", json.dumps(latest).encode())
-        if anchor:
+        if anchor and self.prune_on_anchor:
             # A committed anchor supersedes the whole chain before it; prune so
             # store usage stays bounded at ~1 anchor + one interval of deltas.
             # Readers mid-fetch on a pruned version hit ManifestMissing and

@@ -37,6 +37,11 @@ shared scenarios over duplicate happy-path tests, and assert specific failure ty
 rather than accepting any exception. CPU fixtures do not validate live provider
 authentication, network performance, or an inference engine's reload/ACK lifecycle.
 
+Native OSS changes additionally require `python -m pytest tests/test_oss_store.py -q`.
+These tests use an in-memory SDK boundary, without cloud credentials or live writes.
+Provider tests cover SDK errors and resource handling; generic reconstruction and
+retention scenarios belong in the shared HTTP/engine suite.
+
 ## Pull requests
 
 - Keep algorithm changes in `src/dte/core` independent of transport backends unless the

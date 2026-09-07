@@ -224,6 +224,7 @@ python -m pip install -e ".[awex]"      # dingzhiqiang/asystem-awex + NCCL runti
 python -m pip install -e ".[mooncake]"  # Mooncake Transfer Engine
 python -m pip install -e ".[http]"      # 共享文件系统暂存传输
 python -m pip install -e ".[http,s3]"   # 额外安装 S3-compatible store provider
+python -m pip install -e ".[http,oss]"  # 原生 Alibaba Cloud OSS provider
 ```
 
 默认安装已经可以使用 core algorithm 和 loopback backend。集群后端还需要对应 runtime、硬件和 分布式环境。发布 PyPI 之后，可以使用
@@ -278,6 +279,19 @@ Sender 和 receiver 实例需要跨 step 保留。示例使用单 writer，由�
 latest，不自动补齐跳过的 delta。多 writer 使用 `publish` / `write_manifest` / `iter_fetch`，shard
 路由由应用负责；单个 `reconstruct_stream` 要求跨 writer 的参数名唯一。通过 writer marker 提前读取时，仍需等待最终 manifest
 才能对推理暴露新版本。新 anchor 会删除更早版本，遇到并发清理的 reader 需要重新加载当前 anchor。
+
+原生 OSS 路径由应用创建带 V2 或 V4 认证的 `oss2.Bucket`，然后注入 provider：
+
+```python
+from dte.backends import HttpTransport, OSSStore
+
+store = OSSStore(bucket_client=oss_bucket, prefix="dte/run-1")
+transport = HttpTransport(store, stream="policy", prune_on_anchor=False)
+```
+
+`prune_on_anchor=False` 保留旧版本，由应用单独管理清理；默认值仍为 `True`，保持已有行为。 OSS
+路径使用内存缓冲，不需要本地暂存文件。默认对至少 64 MiB 的 blob 使用顺序 multipart 上传，可配置阈值和 part 大小；打包后的完整 blob
+仍占用内存。中断上传不会提交对象，未完成的 multipart 需要单独清理。凭据、endpoint、region 和 SDK 连接设置由应用管理。
 
 ## 开发
 
