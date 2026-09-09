@@ -329,8 +329,23 @@ transport = HttpTransport(store, stream="policy", prune_on_anchor=False)
 default remains `True` for compatibility. Native OSS reads and writes use memory
 buffers, with no local staging files. Blobs of at least 64 MiB use sequential multipart
 uploads (configurable); multipart does not remove the need to hold the packed blob in
-memory. An interrupted upload does not commit an object; incomplete uploads require
-separate cleanup. Credentials and deployment-specific endpoints never belong in code.
+memory. Incomplete multipart uploads require separate cleanup; a lost completion
+response does not imply that the object was not committed. Credentials and
+deployment-specific endpoints never belong in code.
+
+OSS GET (including response-body reads), HEAD, and listing pages retry transient
+connection/time-out errors and HTTP 429/500/502/503/504 up to four attempts by default.
+Backoff starts at 0.5 seconds and doubles, capped at 8 seconds; configure
+`read_attempts` and `read_backoff` on `OSSStore`. Attempt counts include the initial
+request; setting an attempt count to one disables retries for that operation class.
+Failed GET responses are closed and retried from the beginning. Authentication, missing
+objects, TLS verification, and checksum errors remain failures. Uploads also retry
+transient failures (controlled by `write_attempts`, default four, using the same
+`read_backoff` setting). PUT and individual parts replay identical bytes. Ambiguous
+multipart completion is accepted only after reading back identical object bytes;
+initialization retries can leave empty upload sessions for separate cleanup.
+Applications must serialize updates to mutable keys such as `latest.json`. DELETE is not
+automatically retried.
 
 ## Development
 

@@ -291,7 +291,13 @@ transport = HttpTransport(store, stream="policy", prune_on_anchor=False)
 
 `prune_on_anchor=False` 保留旧版本，由应用单独管理清理；默认值仍为 `True`，保持已有行为。 OSS
 路径使用内存缓冲，不需要本地暂存文件。默认对至少 64 MiB 的 blob 使用顺序 multipart 上传，可配置阈值和 part 大小；打包后的完整 blob
-仍占用内存。中断上传不会提交对象，未完成的 multipart 需要单独清理。凭据、endpoint、region 和 SDK 连接设置由应用管理。
+仍占用内存。未完成的 multipart 需要单独清理；完成响应丢失不代表对象没有提交。凭据、endpoint、region 和 SDK 连接设置由应用管理。
+
+OSS 的 GET（含响应体读取）、HEAD、分页 LIST 和上传会对临时连接中断、超时及 HTTP 429/500/502/503/504
+做有界重试。`read_attempts`、`write_attempts` 默认均为 4，包含首次请求； 设为 1 可关闭对应类别的重试。两类操作共用
+`read_backoff`：默认 0.5 秒，指数退避，上限 8 秒。 GET 失败后关闭响应并从头读取；认证、对象不存在、TLS 校验和 checksum
+错误不会自动重试。 PUT 和单个 multipart part 重试相同字节；完成响应不明确时，只有读回对象与原始字节完全一致才认定成功。 初始化重试可能遗留空 upload
+session，需要应用单独清理。应用必须串行更新 `latest.json` 等可变 key； DELETE 不自动重试。
 
 ## 开发
 

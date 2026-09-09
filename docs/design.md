@@ -81,8 +81,13 @@ apply 期间应暂停推理，并在所有 writer 完成且 manifest 可见后�
 
 原生 OSS 使用 `OSSStore` 实现相同 `BlobStore` 契约。应用注入已经初始化的 `oss2.Bucket`， 明确选择 endpoint
 和签名模式；provider 不探测或自动降级签名。所有 key 限制在独立 run prefix。 普通对象使用 PUT/GET，大对象通过 multipart 的
-complete 操作提交；失败的 multipart 保留为未完成 上传，由应用清理。Reader 完成读取后关闭响应以释放连接。仅 `NoSuchKey`
-被映射为对象不存在， 鉴权失败、bucket 不存在和网络错误继续向调用方传播。
+complete 操作提交；未完成的 multipart 由应用清理。Reader 完成读取后关闭响应以释放连接。仅 `NoSuchKey` 被映射为对象不存在，鉴权失败和
+bucket 不存在继续向调用方传播。
+
+临时连接中断、超时和指定服务端错误在 provider 内有界重试，耗尽后传播异常；不能由上层独立重放某个 rank 的集体发布请求。 读取重试覆盖响应体消费，PUT/part
+重试保持相同 key、upload ID、part 编号和字节。完成请求可能已成功但响应丢失， 因此只在读回对象与原始字节完全一致时认定该次提交成功。对可变 key
+的更新必须由应用串行执行；初始化重试遗留的 upload session 同样由应用负责清理。重试不改变 manifest-last
+发布顺序，也不等价于推理端已经确认应用新权重。
 
 ## 2. 生命周期
 
