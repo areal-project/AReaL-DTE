@@ -59,6 +59,40 @@ exchange，本地 self-copy 和 cross-rank P2P 在同一个调用里完成，所
 
 这个边界让 CPU 单测能覆盖算法主体。真正依赖集群的部分只剩 backend integration。
 
+### 1.3 Staged blob backend
+
+`HttpTransport` 不要求 sender 和 receiver 之间存在实时连接。每个 writer 把当前 anchor 或 delta 写成
+zstd-compressed safetensors chunk，通过 `BlobStore` 暂存到共享文件系统或 S3-compatible object
+store。文件和 tensor checksum 都按 writer 作用域记录，因此不同 writer 可以安全地发布同名参数 shard。
+
+Writer 先原子写 payload，再发布自己的完成 marker；rank 0 收齐所有 writer metadata 后最后 写 version manifest 和
+`latest.json`。Reader 只有在 manifest 完整时才把版本视为已提交，也可以 通过 writer marker 提前流式应用已经完成的 shard。新的
+full anchor 默认会删除更早的 anchor 和 delta；`prune_on_anchor=False` 可关闭自动删除， 让应用为慢 reader
+保留版本并单独运行清理。
+
+`DeltaEngine.reconstruct_stream` 逐 chunk 重建 receiver base。每个 sparse 参数的
+`@delta_idx`/`@delta_val` 必须位于同一 chunk；中途失败会使 version chain 保持未提交状态，下一次 delta
+因此不能错误地应用到部分更新的 base 上。
+
+Store 需要是受信任的目录或 bucket，调用方负责写入权限、版本单调发布和 shard 路由。 Manifest 的 `writers` 数组按 writer rank
+保存 files、tensor checksums 和可选 full-state checksums；此结构不兼容将 checksums 按全局参数名扁平合并的早期原型。 同名
+shard 可以分别校验与拉取，但一个 `reconstruct_stream` 的 base 以参数名索引，因此输入必须 先由调用方路由成不重名的完整参数。Early
+apply 期间应暂停推理，并在所有 writer 完成且 manifest 可见后发布新模型版本；流式重建本身不会轮询 manifest。
+
+原生 OSS 使用 `OSSStore` 实现相同 `BlobStore` 契约。应用注入已经初始化的 `oss2.Bucket`， 明确选择 endpoint
+和签名模式；provider 不探测或自动降级签名。所有 key 限制在独立 run prefix。 普通对象使用 PUT/GET，大对象通过 multipart 的
+complete 操作提交；未完成的 multipart 由应用清理。Reader 完成读取后关闭响应以释放连接。仅 `NoSuchKey` 被映射为对象不存在，鉴权失败和
+bucket 不存在继续向调用方传播。
+
+临时连接中断、超时和指定服务端错误在 provider 内有界重试，耗尽后传播异常；不能由上层独立重放某个 rank 的集体发布请求。 读取重试覆盖响应体消费，PUT/part
+重试保持相同 key、upload ID、part 编号和字节。完成请求可能已成功但响应丢失， 因此只在读回对象与原始字节完全一致时认定该次提交成功。对可变 key
+的更新必须由应用串行执行；初始化重试遗留的 upload session 同样由应用负责清理。重试不改变 manifest-last
+发布顺序，也不等价于推理端已经确认应用新权重。
+
+OSS multipart 的并发由 `upload_workers` 或 `DTE_OSS_UPLOAD_WORKERS` 控制，默认 1。
+每次上传的在途任务数有界，part 重试保持原 upload ID、编号和字节；全部成功后才按编号完成提交。 任何失败都会阻止
+complete，并等待已经运行的请求退出。并发限制不是节点级配额，应用应结合 writer 数量和内存预算设置。GET、manifest 和接收端版本提交顺序不变。
+
 ## 2. 生命周期
 
 ```mermaid
@@ -318,6 +352,8 @@ delta 只传 changed 元素。runtime 如果 release 后不能恢复完整 param
 - colocate P2P payload 构造、zero-nnz 对称性、dtype 分组；
 - `DeltaEngine` 的 full/delta/anchor/no-op/chain-break 路径；
 - loopback、awex 适配器契约、Mooncake pack/unpack。
+- HTTP staged transport 的 shared-filesystem、multi-writer manifest、checksum、chunk
+  streaming 和中断后的 version-chain 行为。
 
 集群侧：
 

@@ -193,6 +193,8 @@ rank 才会走同一套调度序列。
 - `src/dte/backends/loopback.py`：CPU in-memory backend，用于测试。
 - `src/dte/backends/awex_backend.py`：awex adapter，复用 awex transfer plan 和 NCCL 调度。
 - `src/dte/backends/mooncake_backend.py`：Mooncake/RDMA 方向的 packing path 和接口。
+- `src/dte/backends/http_backend.py`：通过共享文件系统或 S3-compatible object store 暂存权重，提供原子
+  manifest、checksum 和有界内存流式传输。
 - `docs/design.md`：完整设计、公式、协议不变量和验证边界。
 - `docs/awex-gpu-verification.md`：`AwexTransport` GPU parity 检查清单。
 
@@ -220,6 +222,9 @@ python -m pip install -e ".[dev]"
 ```bash
 python -m pip install -e ".[awex]"      # dingzhiqiang/asystem-awex + NCCL runtime
 python -m pip install -e ".[mooncake]"  # Mooncake Transfer Engine
+python -m pip install -e ".[http]"      # 共享文件系统暂存传输
+python -m pip install -e ".[http,s3]"   # 额外安装 S3-compatible store provider
+python -m pip install -e ".[http,oss]"  # 原生 Alibaba Cloud OSS provider
 ```
 
 默认安装已经可以使用 core algorithm 和 loopback backend。集群后端还需要对应 runtime、硬件和 分布式环境。发布 PyPI 之后，可以使用
@@ -248,6 +253,57 @@ engine.pull(target_params, version=step)
 `mode="full"` 不做检测，每步都发送 dense weights。standalone engine 在没有外部 mask 时使用 snapshot
 diff；AReaL 示例默认提供 AdamW inversion mask。
 
+当 sender 和 receiver 之间没有实时通信链路时，HTTP backend 可以把每个版本作为 immutable blob 暂存到共享文件系统或
+S3-compatible object store：
+
+```python
+from dte import DeltaEngine
+from dte.backends import HttpTransport, SharedFSStore
+
+store = SharedFSStore("/mnt/weights")
+
+# Trainer process。full payload 没有 header，因此由 begin() 提供版本号。
+sender = DeltaEngine(HttpTransport(store, stream="run-1"))
+sender.transport.begin(step)
+sender.push(model.named_parameters(), version=step)
+
+# 任意能读取相同 store 的 rollout process。
+receiver = DeltaEngine(HttpTransport(store, stream="run-1"))
+receiver.pull(target_params, version=step)
+```
+
+Payload 使用 zstd-compressed safetensors，并同时校验文件和 tensor checksum。完整版本由 manifest
+原子提交；chunked publish/fetch 和 `DeltaEngine.reconstruct_stream` 为大模型限制暂存峰值内存。
+
+Sender 和 receiver 实例需要跨 step 保留。示例使用单 writer，由调用方等待发布并按版本顺序消费； `recv()` 只读取一次
+latest，不自动补齐跳过的 delta。多 writer 使用 `publish` / `write_manifest` / `iter_fetch`，shard
+路由由应用负责；单个 `reconstruct_stream` 要求跨 writer 的参数名唯一。通过 writer marker 提前读取时，仍需等待最终 manifest
+才能对推理暴露新版本。新 anchor 会删除更早版本，遇到并发清理的 reader 需要重新加载当前 anchor。
+
+原生 OSS 路径由应用创建带 V2 或 V4 认证的 `oss2.Bucket`，然后注入 provider：
+
+```python
+from dte.backends import HttpTransport, OSSStore
+
+store = OSSStore(bucket_client=oss_bucket, prefix="dte/run-1")
+transport = HttpTransport(store, stream="policy", prune_on_anchor=False)
+```
+
+`prune_on_anchor=False` 保留旧版本，由应用单独管理清理；默认值仍为 `True`，保持已有行为。 OSS
+路径使用内存缓冲，不需要本地暂存文件。默认对至少 64 MiB 的 blob 使用顺序 multipart 上传，可配置阈值和 part 大小；打包后的完整 blob
+仍占用内存。未完成的 multipart 需要单独清理；完成响应丢失不代表对象没有提交。凭据、endpoint、region 和 SDK 连接设置由应用管理。
+
+OSS 的 GET（含响应体读取）、HEAD、分页 LIST 和上传会对临时连接中断、超时及 HTTP 429/500/502/503/504
+做有界重试。`read_attempts`、`write_attempts` 默认均为 4，包含首次请求； 设为 1 可关闭对应类别的重试。两类操作共用
+`read_backoff`：默认 0.5 秒，指数退避，上限 8 秒。 GET 失败后关闭响应并从头读取；认证、对象不存在、TLS 校验和 checksum
+错误不会自动重试。 PUT 和单个 multipart part 重试相同字节；完成响应不明确时，只有读回对象与原始字节完全一致才认定成功。 初始化重试可能遗留空 upload
+session，需要应用单独清理。应用必须串行更新 `latest.json` 等可变 key； DELETE 不自动重试。
+
+可通过 `OSSStore(..., upload_workers=4)` 或 `DTE_OSS_UPLOAD_WORKERS=4` 并发上传独立
+part；显式参数优先，默认值为 1，保持串行行为。在途任务数按单次上传限制，所有 part 成功后 才按序
+complete；失败时等待在途请求结束后抛错，不提交不完整对象。应按节点上的 writer 总数 控制总并发，同时考虑完整 blob 和在途 part
+缓冲的内存；此设置不改变 manifest/ACK 语义。
+
 ## 开发
 
 ```bash
@@ -271,6 +327,7 @@ CPU 测试覆盖 core algorithm、`DeltaEngine`、loopback transport 和不需�
 | `loopback` backend   | Local test backend.                                                                                                                                                                 |
 | `awex` backend       | Adapter 使用 `dingzhiqiang/asystem-awex`；colocate sparse path 支持合并后的两轮 metadata/data exchange。真实跨 rank parity 仍需要 NCCL + MetaServer + megatron/sglang。             |
 | `mooncake` backend   | Interface and pack/unpack path are present. RDMA execution needs a Mooncake runtime.                                                                                                |
+| `http` backend       | CPU tests cover shared filesystem、multi-writer manifest、chunk streaming、retention、corruption handling 和 S3 contract。                                                          |
 
 ## License
 

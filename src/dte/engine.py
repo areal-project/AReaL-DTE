@@ -29,8 +29,13 @@ from dataclasses import dataclass
 import torch
 
 from dte.core import (
+    DELTA_HEADER_NAME,
+    DELTA_IDX_SUFFIX,
+    DELTA_VAL_SUFFIX,
     DecodedDelta,
+    DeltaHeader,
     DeltaTracker,
+    apply_sparse_patch_,
     decode_delta_payload,
     is_delta_payload,
     reconstruct_against_base,
@@ -291,6 +296,186 @@ class DeltaEngine:
                     m[indices.to(full.device).long()] = True
                 masks[name] = m.view(full.shape)
         return result, masks
+
+    def reconstruct_stream(
+        self,
+        chunks: Iterable[dict[str, torch.Tensor] | Iterable[Payload]],
+        version: int,
+    ):
+        """Chunk-at-a-time ``reconstruct`` for staged payloads (http tensor mode).
+
+        Consumes ``HttpTransport.iter_fetch``-shaped chunks (each a
+        ``{name: tensor}`` dict or a ``Payload`` list) and yields
+        ``{name: full_tensor}`` per chunk, covering ONLY the params present in
+        that chunk — unchanged params are never materialized or yielded, and no
+        masks are built, so receiver peak memory is base + ~one chunk instead of
+        base + full result + masks.
+
+        Chunking contract (guaranteed by ``HttpTransport``): a sparse pair
+        (``w@delta_idx``/``w@delta_val``) never splits across chunks, and each
+        writer's header rides in its first chunk. Multiple writers may each
+        contribute a header; their sparse/dense counts are summed and verified
+        against the stream total on completion.
+
+        TODO(agent): Keep each sparse index/value pair in one chunk unless this
+        method gains cross-chunk pair buffering.
+
+        Version-chain safety mirrors ``reconstruct`` with one stream-specific
+        rule: the chain check runs eagerly (before anything is yielded), and the
+        receiver's ``base_version`` is invalidated while chunks are being
+        applied — it only advances to the payload version after the stream
+        completes and the counts match. A mid-stream failure therefore leaves
+        the receiver chain-broken (next delta raises ``DeltaChainBroken`` and
+        the caller requests a fresh full sync).
+
+        Raises ``DeltaChainBroken`` on no-base / base-mismatch / stale full
+        sync; ``ValueError`` on corrupt or incomplete streams (unpaired sparse
+        entries, sparse param absent from base, count mismatch, empty stream).
+        """
+        it = iter(chunks)
+        try:
+            first = self._chunk_dict(next(it))
+        except StopIteration:
+            raise ValueError("reconstruct_stream got an empty chunk stream")
+
+        if not is_delta_payload(first):
+            if self._base_version is not None and version < self._base_version:
+                raise DeltaChainBroken(
+                    f"Full-sync version {version} is older than the receiver's "
+                    f"current base {self._base_version} (stale/reordered payload)."
+                )
+            return self._stream_full_sync(first, it, version)
+
+        header = DeltaHeader.from_tensor(first[DELTA_HEADER_NAME].cpu())
+        if header.payload_version != version:
+            raise DeltaChainBroken(
+                "Stream payload version does not match requested version"
+            )
+        if self._base_version is None or not self._base:
+            raise DeltaChainBroken(
+                f"Delta at version {version} but receiver has no base "
+                f"(base_version={self._base_version}); request full sync."
+            )
+        if header.base_version != self._base_version:
+            raise DeltaChainBroken(
+                f"Delta base mismatch: payload base={header.base_version}, "
+                f"receiver base={self._base_version}; request full sync."
+            )
+        return self._stream_delta(header, first, it, version)
+
+    @staticmethod
+    def _chunk_dict(chunk) -> dict[str, torch.Tensor]:
+        if isinstance(chunk, dict):
+            return chunk
+        return {p.name: p.values for p in chunk}
+
+    def _stream_full_sync(self, first, rest, version: int):
+        self._base = {}
+        self._base_version = None
+        for chunk in self._iter_chunks(first, rest):
+            if is_delta_payload(chunk) or self._base.keys() & chunk.keys():
+                raise ValueError(
+                    "Full stream requires unique parameter names and no delta headers"
+                )
+            for name, tensor in chunk.items():
+                self._base[name] = tensor.detach().to("cpu").clone()
+            yield chunk
+        self._base_version = version
+
+    @torch.no_grad()
+    def _stream_delta(self, header, first, rest, version: int):
+        expected = {"sparse": 0, "dense": 0}
+        counts = {"sparse": 0, "dense": 0}
+        base_version = self._base_version
+        self._base_version = None
+        seen = set()
+        for chunk in self._iter_chunks(first, rest):
+            result = self._apply_delta_chunk(chunk, header, expected, counts)
+            if seen & result.keys():
+                raise ValueError(
+                    "Delta stream requires unique parameter names across writers"
+                )
+            seen.update(result)
+            yield result
+        if counts != expected:
+            raise ValueError(
+                f"Delta stream count mismatch: headers promised {expected}, "
+                f"stream carried {counts}; incomplete or corrupt chunking."
+            )
+        self._base_version = header.payload_version
+        logger.info(
+            "dte stream-reconstructed step %d (base=%s) sparse=%d dense=%d",
+            version,
+            base_version,
+            counts["sparse"],
+            counts["dense"],
+        )
+
+    def _iter_chunks(self, first, rest):
+        yield first
+        for chunk in rest:
+            yield self._chunk_dict(chunk)
+
+    def _apply_delta_chunk(
+        self,
+        chunk: dict[str, torch.Tensor],
+        header,
+        expected: dict[str, int],
+        counts: dict[str, int],
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        pending_idx: dict[str, torch.Tensor] = {}
+        pending_val: dict[str, torch.Tensor] = {}
+        for name, tensor in chunk.items():
+            if name == DELTA_HEADER_NAME:
+                extra = DeltaHeader.from_tensor(tensor.cpu())
+                if (extra.base_version, extra.payload_version) != (
+                    header.base_version,
+                    header.payload_version,
+                ):
+                    raise ValueError(
+                        f"Delta stream header disagreement: expected "
+                        f"base={header.base_version}->v{header.payload_version}, "
+                        f"got base={extra.base_version}->v{extra.payload_version}."
+                    )
+                # One header per writer; summing them yields the stream total.
+                expected["sparse"] += extra.num_sparse
+                expected["dense"] += extra.num_dense
+                continue
+            if name.endswith(DELTA_IDX_SUFFIX):
+                pending_idx[name[: -len(DELTA_IDX_SUFFIX)]] = tensor
+            elif name.endswith(DELTA_VAL_SUFFIX):
+                pending_val[name[: -len(DELTA_VAL_SUFFIX)]] = tensor
+            else:
+                full = tensor
+                base_cpu = self._base.get(name)
+                if base_cpu is not None:
+                    base_cpu.copy_(full.detach().to("cpu"))
+                else:
+                    self._base[name] = full.detach().to("cpu").clone()
+                out[name] = full
+                counts["dense"] += 1
+
+        if set(pending_idx) != set(pending_val):
+            missing = set(pending_idx).symmetric_difference(pending_val)
+            raise ValueError(
+                f"Corrupt delta chunk, unpaired sparse entries: {missing} "
+                "(idx/val pairs must never split across chunks)."
+            )
+        for name, indices in pending_idx.items():
+            values = pending_val[name]
+            base_cpu = self._base.get(name)
+            if base_cpu is None:
+                raise ValueError(
+                    f"Delta sparse param absent from base, cannot reconstruct "
+                    f"(unknown full shape): ['{name}']"
+                )
+            full = base_cpu.to(values.device, copy=True)
+            apply_sparse_patch_(full, indices, values)
+            base_cpu.copy_(full.detach().to("cpu"))
+            out[name] = full
+            counts["sparse"] += 1
+        return out
 
     @torch.no_grad()
     def decode_for_live_apply(
